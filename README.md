@@ -96,10 +96,12 @@ targets, and loss.
 
 ### 100STYLE preprocessing
 
-The 100STYLE preprocessor discovers SOMA77 BVHs directly, creates complete
-non-overlapping windows, shuffles all windows with a fixed seed, and writes an
-80/10/10 train/validation/test split in the same NPY format. No external split
-path files are required.
+The 100STYLE preprocessor uses the included official
+[`Frame_Cuts.csv`](dataset/Frame_Cuts.csv), trims each original 60 FPS motion
+with stop-exclusive `[START:STOP]` bounds, resamples the trimmed sequence to 30
+FPS, and creates complete non-overlapping 90-frame windows. The default split
+is content-disjoint: `BR/BW/FR/SR/SW` are training contents and all `FW`
+motions form the test set. Validation is intentionally empty.
 
 Run a small end-to-end preview with:
 
@@ -107,13 +109,15 @@ Run a small end-to-end preview with:
 python dataset/preprocess_100style.py \
   --limit 10 \
   --workers 1 \
-  --output dataset/100style-processed-preview
+  --output dataset/100style-soma77-processed-preview
 ```
 
 Omit `--limit` to process every `bvh/*_soma77.bvh` file under
-`dataset/100STYLE_soma77`. Windows from the same source motion may be assigned
-to different splits, but windows never overlap and therefore never share input
-frames.
+`dataset/100STYLE_soma77`. Override the protocol only explicitly with
+`--contents ... --test-content ...`; content names, style coverage, source
+availability, and every frame-cut range are checked strictly. Metadata records
+the CSV SHA256 and trim/resampling convention, so an older split protocol is
+not silently reused.
 
 Workers convert and save source motions directly, avoiding transfer of large
 feature arrays back to the parent process. Training uses global per-epoch
@@ -151,6 +155,15 @@ of the target over valid tokens. See
 `configs/mjepa_patch_2d_tiny_coarse7_body_region_segment.yaml` for the default
 2–3 group, 30–60% temporal setup. Omitting `mask.strategy` preserves the
 original multiblock behavior.
+
+Set `mask.strategy: random_body_segment` to sample several separate target
+masks, each formed by a contiguous temporal segment over uniformly random
+coarse7 body groups. Target masks are cell-disjoint, the encoder observes their
+exact complement, and `body_mask_ratio` controls only how many of the seven
+groups each target selects; it does not use the skeleton graph. See
+`configs/mjepa_patch_2d_tiny_coarse7_part1-3_frame15-25.yaml` for the
+four-target, 1–3 group, 15–25% temporal setup. The matching one-group control
+is `configs/mjepa_patch_2d_tiny_coarse7_part1_frame15-25.yaml`.
 
 ## Model variants
 
@@ -236,7 +249,7 @@ train a single linear style classifier on 100STYLE:
 ```bash
 python -m experiment.linear_probe \
   --checkpoint output/<run>/motion-jepa-1d-latest.pth.tar \
-  --dataset-root dataset/100style-processed \
+  --dataset-root dataset/100style-soma77-processed \
   --output output/linear-probe/<run>
 ```
 
@@ -265,9 +278,11 @@ ordinary cross-entropy and momentum SGD. Use `--overwrite` to rerun the head
 while retaining valid feature caches, or `--recompute-features` when the
 checkpoint, dataset index, statistics, or extraction setup has changed.
 
-Per-epoch train and validation metrics are written to `metrics.csv`. The head
-with the best validation top-1 accuracy is restored for the single final test
-evaluation recorded in `summary.json`.
+For the default validation-free dataset, the probe protocol is fixed in
+advance: 50 epochs, SGD with LR 0.3, momentum 0.9, zero weight decay, and cosine
+decay. Per-epoch training metrics are written to `metrics.csv`; the epoch-50
+head is saved and `FW` test is evaluated exactly once. `summary.json` records
+`selection: fixed_last_epoch` and `validation_used: false`.
 
 To monitor representation quality during pretraining, opt a training config into
 an in-memory 100STYLE probe:
@@ -294,18 +309,21 @@ The EMA target encoder is evaluated before the first training epoch, at every
 `linear_probe.frequency` epoch, and at the final epoch. When `frequency` is
 omitted, it defaults to `logging.checkpoint_freq` for backward compatibility.
 This cadence does not create additional named epoch checkpoints. Features
-remain in memory rather than being cached per checkpoint. Validation and test
-top-1 are written under the `linear_probe/`
-TensorBoard namespace, while only validation top-1 selects
-`<write_tag>-best-accuracy.pth.tar`. That file is a full resumable training
-checkpoint. Linear probing is disabled when the section is absent or
-`enabled: false`.
+remain in memory rather than being cached per checkpoint. The fixed-protocol
+`FW` metrics are diagnostic trajectories under `linear_probe/test_*`. They do
+not create `<write_tag>-best-accuracy.pth.tar` and do not select a pretraining
+checkpoint; use latest or a named epoch checkpoint for final comparison.
+Linear probing is disabled when the section is absent or `enabled: false`.
 
 Sweep every direct-child latest checkpoint with:
 
 ```bash
 python -m experiment.linear_probe.lr_sweep --device cuda:0
 ```
+
+LR sweeps and validation-selected reports reject validation-free datasets.
+They are retained only for legacy datasets with a genuine non-empty validation
+split, preventing `FW` test results from becoming an implicit tuning set.
 
 The sweep writes its component artifacts to
 `findings/000-100style-classification/linear-probe` by default.

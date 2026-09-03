@@ -64,7 +64,13 @@ def _write_split(
     return records
 
 
-def _write_dataset(root: Path, *, num_frames: int = 4, motion_dim: int = 6) -> None:
+def _write_dataset(
+    root: Path,
+    *,
+    num_frames: int = 4,
+    motion_dim: int = 6,
+    validation_enabled: bool = True,
+) -> None:
     fps = 30
     records = []
     records.extend(
@@ -86,7 +92,9 @@ def _write_dataset(root: Path, *, num_frames: int = 4, motion_dim: int = 6) -> N
         _write_split(
             root,
             "val",
-            [("val-a", -0.9, "A"), ("val-b", 0.9, "B")],
+            [("val-a", -0.9, "A"), ("val-b", 0.9, "B")]
+            if validation_enabled
+            else [],
             num_frames=num_frames,
             motion_dim=motion_dim,
             fps=fps,
@@ -110,6 +118,8 @@ def _write_dataset(root: Path, *, num_frames: int = 4, motion_dim: int = 6) -> N
                 "motion_dim": motion_dim,
                 "num_frames": num_frames,
                 "fps": fps,
+                "validation_enabled": validation_enabled,
+                "test_contents": ["FW"] if not validation_enabled else [],
             }
         )
         + "\n",
@@ -237,6 +247,58 @@ class LinearProbeUnitTest(unittest.TestCase):
 
 
 class LinearProbeEndToEndTest(unittest.TestCase):
+    def test_validation_free_probe_saves_last_epoch_and_tests_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_root = root / "dataset"
+            output = root / "output"
+            _write_dataset(dataset_root, validation_enabled=False)
+            checkpoint = root / "checkpoint.pth.tar"
+            _write_checkpoint(checkpoint, dataset_root / "stats")
+            args = argparse.Namespace(
+                checkpoint=checkpoint,
+                dataset_root=dataset_root,
+                output=output,
+                checkpoint_key="target_encoder",
+                stats_path=None,
+                device="cpu",
+                feature_batch_size=4,
+                batch_size=2,
+                num_workers=0,
+                epochs=3,
+                lr=0.3,
+                momentum=0.9,
+                weight_decay=0.0,
+                seed=0,
+                pooling=linear_probe.GLOBAL_MEAN_POOLING,
+                recompute_features=False,
+                overwrite=False,
+            )
+            original = train_probe.evaluate_classifier
+            test_calls = 0
+
+            def counting_evaluate(classifier, features, labels, **kwargs):
+                nonlocal test_calls
+                if features.shape[0] == 2:
+                    test_calls += 1
+                return original(classifier, features, labels, **kwargs)
+
+            from unittest import mock
+            with mock.patch.object(train_probe, "evaluate_classifier", side_effect=counting_evaluate):
+                summary = train_probe.run(args)
+            self.assertEqual(summary["selection"], "fixed_last_epoch")
+            self.assertFalse(summary["validation_used"])
+            self.assertEqual(summary["best_epoch"], 3)
+            self.assertIsNone(summary["best_val"])
+            self.assertEqual(summary["test_content"], "FW")
+            self.assertEqual(test_calls, 1)
+            self.assertFalse((output / "features/val.pt").exists())
+            self.assertEqual(summary["head_filename"], "linear-probe-final.pth.tar")
+            self.assertFalse((output / "linear-probe-best.pth.tar").exists())
+            head = torch.load(output / "linear-probe-final.pth.tar", weights_only=False)
+            self.assertEqual(head["selection"], "fixed_last_epoch")
+            self.assertEqual(head["epoch"], 3)
+
     def test_cpu_feature_cache_and_two_epoch_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

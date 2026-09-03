@@ -130,6 +130,30 @@ class Patch2DTrainingSmokeTest(unittest.TestCase):
             self.assertEqual(result["global_step"], 1)
             self.assertTrue(Path(result["checkpoint"]).is_file())
 
+    def test_random_body_segment_trains_one_step_with_four_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset"
+            write_npy_dataset(
+                dataset,
+                [
+                    np.random.default_rng(index).normal(size=(6, 366)).astype(np.float32)
+                    for index in range(2)
+                ],
+            )
+            config = self._config(dataset, root / "output-random-body", "coarse7")
+            config["mask"] = {
+                "strategy": "random_body_segment",
+                "allow_overlap": False,
+                "num_enc_masks": 1,
+                "num_pred_masks": 4,
+                "pred_frame_mask_ratio": [0.15, 0.25],
+                "body_mask_ratio": [1.0 / 7.0, 3.0 / 7.0],
+            }
+            result = train_main(config, device="cpu")
+            self.assertEqual(result["global_step"], 1)
+            self.assertTrue(Path(result["checkpoint"]).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

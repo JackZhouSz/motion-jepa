@@ -51,6 +51,17 @@ def _summary(name: str, val_top1: float, test_top1: float) -> dict:
 
 
 class UnifiedReportTest(unittest.TestCase):
+    def test_validation_free_sweep_report_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sweep_root = root / "linear-probe"
+            sweep_root.mkdir()
+            (sweep_root / "sweep-config.json").write_text(
+                json.dumps({"checkpoints": [{"split_counts": {"val": 0}}]})
+            )
+            with self.assertRaisesRegex(ValueError, "validation-free"):
+                report.run(root)
+
     def test_percentage_formatting(self):
         self.assertEqual(report._percent(0.948355), "94.84")
 

@@ -36,6 +36,18 @@ def _summary(val_top1: float, test_top1: float, probe_epoch: int) -> dict:
     }
 
 
+def _fixed_summary(test_top1: float, probe_epoch: int) -> dict:
+    result = _summary(0.0, test_top1, probe_epoch)
+    result.update(
+        selection="fixed_last_epoch",
+        validation_used=False,
+        best_val=None,
+        split_counts={"train": 2, "val": 0, "test": 2},
+        test_content="FW",
+    )
+    return result
+
+
 class _Writer:
     def __init__(self):
         self.scalars: list[tuple[str, float, int]] = []
@@ -75,7 +87,67 @@ class _FakeOnlineProbe:
         return result
 
 
+class _FakeFixedOnlineProbe(_FakeOnlineProbe):
+    summaries = [_fixed_summary(0.55, 2), _fixed_summary(0.75, 2)]
+    calls = 0
+
+
 class OnlineProbeTrainingTest(unittest.TestCase):
+    def test_validation_free_online_probe_never_creates_best_accuracy_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset, output = root / "dataset", root / "output"
+            write_npy_dataset(
+                dataset,
+                [np.zeros((4, 6), dtype=np.float32), np.ones((4, 6), dtype=np.float32)],
+            )
+            config = {
+                "data": {
+                    "batch_size": 2, "root_path": str(dataset), "meta_files": ["train.txt"],
+                    "num_workers": 0, "pin_mem": False, "persistent_workers": False,
+                    "drop_last": True, "num_frames": 4, "fps": 60, "motion_dim": 6,
+                    "num_joints": 30, "normalize": False, "stats_path": None,
+                },
+                "logging": {
+                    "folder": str(output), "write_tag": "fixed-probe", "log_freq": 1,
+                    "checkpoint_freq": 1, "tensorboard": True,
+                },
+                "mask": {
+                    "allow_overlap": False, "num_enc_masks": 1, "num_pred_masks": 1,
+                    "enc_frame_mask_ratio": [0.75, 0.75],
+                    "pred_frame_mask_ratio": [0.25, 0.25],
+                },
+                "meta": {
+                    "seed": 0, "load_checkpoint": False, "read_checkpoint": None,
+                    "model_name": "mot_tiny_1d", "predictor_name": "mot_predictor_tiny_1d",
+                    "use_bfloat16": False, "use_float16": False,
+                },
+                "optimization": {
+                    "ema": [0.9, 1.0], "epochs": 1, "final_lr": 1.0e-5,
+                    "final_weight_decay": 0.4, "ipe_scale": 1.0, "lr": 1.0e-3,
+                    "start_lr": 1.0e-4, "warmup": 0, "weight_decay": 0.04,
+                },
+                "linear_probe": {"enabled": True, "frequency": 1},
+            }
+            writer = _Writer()
+            _FakeFixedOnlineProbe.calls = 0
+            with patch(
+                "experiment.linear_probe.online.OnlineLinearProbe", _FakeFixedOnlineProbe
+            ), patch("train._make_tensorboard_writer", return_value=writer):
+                train_main(config, device="cpu")
+            self.assertEqual(_FakeFixedOnlineProbe.calls, 2)
+            self.assertFalse((output / "fixed-probe-best-accuracy.pth.tar").exists())
+            latest = torch.load(
+                output / "fixed-probe-latest.pth.tar", map_location="cpu", weights_only=False
+            )
+            self.assertEqual(latest["linear_probe_latest"]["selection"], "fixed_last_epoch")
+            self.assertIsNone(latest["best_probe_epoch"])
+            self.assertEqual(
+                [event for event in writer.scalars if event[0] == "linear_probe/test_top1_accuracy"],
+                [("linear_probe/test_top1_accuracy", 0.55, 0),
+                 ("linear_probe/test_top1_accuracy", 0.75, 1)],
+            )
+
     def test_real_in_memory_probe_evaluates_without_writing_feature_caches(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

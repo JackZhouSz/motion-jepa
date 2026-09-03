@@ -37,6 +37,7 @@ RESULT_FILENAMES = (
     "metrics.csv",
     "summary.json",
     "linear-probe-best.pth.tar",
+    "linear-probe-final.pth.tar",
     "class-index.json",
 )
 
@@ -128,8 +129,15 @@ def train_linear_probe(
         shuffle=True,
         generator=generator,
     )
+    validation_used = int(len(caches["val"]["labels"])) > 0
+    selection = "validation_best" if validation_used else "fixed_last_epoch"
     metrics_path = None if output is None else output / "metrics.csv"
-    best_path = None if output is None else output / "linear-probe-best.pth.tar"
+    best_path = (
+        None
+        if output is None
+        else output
+        / ("linear-probe-best.pth.tar" if validation_used else "linear-probe-final.pth.tar")
+    )
     best_accuracy = -1.0
     best_epoch = 0
     fields = [
@@ -172,24 +180,30 @@ def train_linear_probe(
                 batch_size=batch_size,
                 num_classes=num_classes,
             )
-            val_metrics = evaluate_classifier(
-                classifier,
-                caches["val"]["features"],
-                caches["val"]["labels"],
-                device=device,
-                batch_size=batch_size,
-                num_classes=num_classes,
-            )
+            val_metrics = None
+            if validation_used:
+                val_metrics = evaluate_classifier(
+                    classifier,
+                    caches["val"]["features"],
+                    caches["val"]["labels"],
+                    device=device,
+                    batch_size=batch_size,
+                    num_classes=num_classes,
+                )
             row = {
                 "epoch": epoch,
                 "learning_rate": current_lr,
                 **{f"train_{key}": value for key, value in asdict(train_metrics).items()},
-                **{f"val_{key}": value for key, value in asdict(val_metrics).items()},
+                **(
+                    {f"val_{key}": value for key, value in asdict(val_metrics).items()}
+                    if val_metrics is not None
+                    else {f"val_{key}": "" for key in asdict(train_metrics)}
+                ),
             }
             if writer is not None:
                 writer.writerow(row)
                 file.flush()
-            if val_metrics.top1_accuracy > best_accuracy:
+            if val_metrics is not None and val_metrics.top1_accuracy > best_accuracy:
                 best_accuracy = val_metrics.top1_accuracy
                 best_epoch = epoch
                 best = {
@@ -207,6 +221,23 @@ def train_linear_probe(
                 if best_path is not None:
                     _atomic_torch_save(best, best_path)
             scheduler.step()
+        if not validation_used:
+            best_epoch = epochs
+            best = {
+                "format_version": 1,
+                "classifier": copy.deepcopy(classifier.state_dict()),
+                "feature_dim": feature_dim,
+                "num_classes": num_classes,
+                "class_names": class_names,
+                "epoch": epochs,
+                "val_metrics": None,
+                "selection": selection,
+                "checkpoint": None if checkpoint_path is None else str(checkpoint_path),
+                "checkpoint_key": checkpoint_key,
+                "run_args": run_args,
+            }
+            if best_path is not None:
+                _atomic_torch_save(best, best_path)
     finally:
         if file is not None:
             file.close()
@@ -214,7 +245,7 @@ def train_linear_probe(
     if best_path is not None:
         best = torch.load(best_path, map_location=device, weights_only=False)
     if best is None:
-        raise RuntimeError("Linear probe did not produce a validation-best head")
+        raise RuntimeError("Linear probe did not produce a final head")
     classifier.load_state_dict(best["classifier"], strict=True)
     test_metrics = evaluate_classifier(
         classifier,
@@ -227,6 +258,9 @@ def train_linear_probe(
     return {
         "best_epoch": best_epoch,
         "best_val": best["val_metrics"],
+        "selection": selection,
+        "validation_used": validation_used,
+        "head_filename": None if best_path is None else best_path.name,
         "test": asdict(test_metrics),
         "feature_dim": feature_dim,
         "num_classes": num_classes,
@@ -265,6 +299,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"Linear-probe results already exist under {output}: {existing_results}; "
             "use --overwrite to replace result files"
         )
+    if args.overwrite:
+        for name in RESULT_FILENAMES:
+            path = output / name
+            if path.is_file():
+                path.unlink()
     output.mkdir(parents=True, exist_ok=True)
     cache_root = output / "features"
     cache_root.mkdir(exist_ok=True)
@@ -312,19 +351,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             class_names=class_names,
             pooling=pooling,
         )
-        caches[split] = load_or_extract_split(
-            split=split,
-            cache_path=cache_root / f"{split}.pt",
-            metadata=metadata,
-            dataset=datasets[split],
-            encoder=encoder,
-            device=device,
-            batch_size=args.feature_batch_size,
-            num_workers=args.num_workers,
-            use_bfloat16=model_info["use_bfloat16"],
-            recompute=args.recompute_features,
-            pooling=pooling,
-        )
+        if len(datasets[split]) == 0:
+            caches[split] = {
+                "metadata": metadata,
+                "features": torch.empty((0, int(metadata["feature_dim"]))),
+                "labels": torch.empty((0,), dtype=torch.long),
+                "sample_ids": [],
+            }
+        else:
+            caches[split] = load_or_extract_split(
+                split=split,
+                cache_path=cache_root / f"{split}.pt",
+                metadata=metadata,
+                dataset=datasets[split],
+                encoder=encoder,
+                device=device,
+                batch_size=args.feature_batch_size,
+                num_workers=args.num_workers,
+                use_bfloat16=model_info["use_bfloat16"],
+                recompute=args.recompute_features,
+                pooling=pooling,
+            )
 
     if any(parameter.grad is not None for parameter in encoder.parameters()):
         raise RuntimeError("Frozen encoder unexpectedly accumulated gradients")
@@ -343,6 +390,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         seed=args.seed,
         run_args=_serializable_args(args),
     )
+    dataset_metadata = json.loads((dataset_root / "meta.json").read_text(encoding="utf-8"))
+    test_contents = dataset_metadata.get("test_contents", [])
     summary.update(
         {
             "checkpoint": str(checkpoint_path),
@@ -352,6 +401,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "model_name": model_info["model_name"],
             "pooling": pooling,
             "seed": args.seed,
+            "test_content": test_contents[0] if len(test_contents) == 1 else test_contents,
         }
     )
     _atomic_json_save(summary, output / "summary.json")
@@ -364,7 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default=PROJECT_ROOT / "dataset/100style-processed",
+        default=PROJECT_ROOT / "dataset/100style-soma77-processed",
     )
     parser.add_argument(
         "--output",
@@ -387,7 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=0.3)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)

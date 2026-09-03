@@ -43,6 +43,24 @@ METRIC_NAMES = (
 )
 
 
+def require_validation_dataset(dataset_root: Path) -> None:
+    """Reject LR selection when the dataset intentionally has no validation set."""
+    meta_path = dataset_root / "meta.json"
+    if meta_path.is_file():
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if metadata.get("validation_enabled") is False:
+            raise ValueError(
+                "LR sweep is disabled for validation-free datasets; keep the "
+                "pre-registered LR instead of selecting it on the test content"
+            )
+    val_manifest = dataset_root / "val.txt"
+    if val_manifest.is_file() and not val_manifest.read_text(encoding="utf-8").strip():
+        raise ValueError(
+            "LR sweep requires a non-empty validation split and may not use test "
+            "performance for model selection"
+        )
+
+
 def discover_latest_checkpoints(output_root: Path) -> list[tuple[str, Path]]:
     """Find one latest checkpoint in each direct child training directory."""
     if not output_root.is_dir():
@@ -641,6 +659,7 @@ def _write_reports(
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_root = Path(args.output_root).expanduser().resolve()
     dataset_root = Path(args.dataset_root).expanduser().resolve()
+    require_validation_dataset(dataset_root)
     findings_root = Path(args.findings_root).expanduser().resolve()
     findings_root.mkdir(parents=True, exist_ok=True)
     args.dataset_root = dataset_root

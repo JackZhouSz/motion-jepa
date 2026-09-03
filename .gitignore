@@ -5,6 +5,7 @@ __pycache__
 
 dataset/*
 !dataset/*.py
+!dataset/Frame_Cuts.csv
 dataset-bvh/
 output/
 /output

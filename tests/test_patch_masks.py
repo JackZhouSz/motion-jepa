@@ -10,6 +10,7 @@ from mask import (
     PatchBodyRegionSegmentMaskCollator2D,
     PatchMaskCollator1D,
     PatchMaskCollator2D,
+    PatchRandomBodySegmentMaskCollator2D,
 )
 from mask.body_region_collator import COARSE7_GRAPH_EDGES
 from model import TokenLayout
@@ -249,6 +250,90 @@ class PatchMaskCollatorTest(unittest.TestCase):
         config["mask"]["allow_overlap"] = True
         with self.assertRaisesRegex(ValueError, "allow_overlap=false"):
             _build_mask_collator(config, layout)
+
+    @staticmethod
+    def _random_body_collator(**kwargs):
+        options = {
+            "raw_num_frames": 12,
+            "raw_num_joints": 30,
+            "token_num_joints": 7,
+            "temporal_patch_size": 3,
+            "spatial_grouping": "coarse7",
+            "spatial_pooling": "graph_mean",
+            "pred_frame_mask_ratio": (0.25, 0.25),
+            "body_mask_ratio": (1.0 / 7.0, 3.0 / 7.0),
+            "npred": 4,
+        }
+        options.update(kwargs)
+        return PatchRandomBodySegmentMaskCollator2D(**options)
+
+    def test_random_body_masks_are_separate_uniform_segments(self):
+        collator = self._random_body_collator()
+        batch = [(torch.zeros(12, 366), 60, 12) for _ in range(8)]
+        _, contexts, targets = collator(batch)
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(len(targets), 4)
+
+        target_union = torch.stack(targets).any(dim=0)
+        self.assertEqual(
+            target_union.flatten(1).sum(1).tolist(),
+            [sum(int(target[index].sum()) for target in targets) for index in range(8)],
+        )
+        target_counts = [target.flatten(1).sum(1) for target in targets]
+        for target_count in target_counts[1:]:
+            torch.testing.assert_close(target_count, target_counts[0])
+        for target in targets:
+            for sample in target:
+                active_frames = torch.nonzero(sample.any(dim=1)).flatten()
+                self.assertEqual(len(active_frames), 1)
+                groups = sample[active_frames[0]]
+                self.assertGreaterEqual(int(groups.sum()), 1)
+                self.assertLessEqual(int(groups.sum()), 3)
+        valid = torch.ones_like(contexts[0])
+        self.assertFalse(bool((contexts[0] & target_union).any()))
+        torch.testing.assert_close(contexts[0] | target_union, valid)
+
+    def test_random_body_state_restores_next_masks(self):
+        batch = [(torch.zeros(12, 366), 60, 12) for _ in range(2)]
+        first = self._random_body_collator()
+        first(batch)
+        state = first.state_dict()
+        expected = first(batch)[1:]
+        restored = self._random_body_collator()
+        restored.load_state_dict(state)
+        actual = restored(batch)[1:]
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_mask, actual_mask in zip(expected_group, actual_group):
+                torch.testing.assert_close(actual_mask, expected_mask)
+
+    def test_builder_selects_random_body_segment(self):
+        layout = TokenLayout(
+            kind="2d",
+            patchified=True,
+            raw_num_frames=12,
+            token_num_frames=4,
+            temporal_patch_size=3,
+            raw_num_joints=30,
+            token_num_joints=7,
+        )
+        config = {
+            "patch": {
+                "spatial_grouping": "coarse7",
+                "spatial_pooling": "graph_mean",
+            },
+            "mask": {
+                "strategy": "random_body_segment",
+                "allow_overlap": False,
+                "num_enc_masks": 1,
+                "num_pred_masks": 4,
+                "pred_frame_mask_ratio": [0.15, 0.25],
+                "body_mask_ratio": [1.0 / 7.0, 3.0 / 7.0],
+            },
+        }
+        self.assertIsInstance(
+            _build_mask_collator(config, layout),
+            PatchRandomBodySegmentMaskCollator2D,
+        )
 
 
 if __name__ == "__main__":

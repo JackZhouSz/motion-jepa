@@ -425,6 +425,11 @@ def run(findings_root: Path) -> dict[str, Any]:
     sweep_root = findings_root / "linear-probe"
     classifier_root = findings_root / "classifiers"
     sweep_config = _read_json(sweep_root / "sweep-config.json")
+    checkpoints = sweep_config.get("checkpoints", [])
+    if any(item.get("split_counts", {}).get("val") == 0 for item in checkpoints):
+        raise ValueError(
+            "Validation-selected reports are disabled for validation-free datasets"
+        )
     aggregates = _read_csv(sweep_root / "aggregate-results.csv")
     classifier_results = _read_json(classifier_root / "results.json")
     seeds = [int(value) for value in sweep_config["seeds"]]

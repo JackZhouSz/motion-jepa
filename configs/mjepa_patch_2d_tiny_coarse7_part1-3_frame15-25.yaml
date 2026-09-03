@@ -1,0 +1,62 @@
+data:
+  batch_size: 256  # Per rank; tune for model size and available memory.
+  root_path: ./dataset/bones-seed-processed
+  meta_files:
+    - train.txt
+  num_workers: 4
+  pin_mem: true
+  persistent_workers: true
+  drop_last: true
+  num_frames: 90
+  fps: 30
+  motion_dim: 366
+  num_joints: 30
+  normalize: true
+  stats_path: stats
+
+patch:
+  temporal_patch_size: 3
+  spatial_grouping: coarse7
+  spatial_pooling: graph_mean
+
+logging:
+  folder: ./output/mot_patch_tiny_2d-p3-coarse7-part1-3-frame15-25-bs.256-ep.300
+  write_tag: motion-jepa-patch-2d-p3-coarse7-part1-3-frame15-25
+  log_freq: 100
+  tensorboard: true
+  tensorboard_folder: tensorboard
+  checkpoint_freq: 50
+
+linear_probe:
+  enabled: true
+  frequency: 10
+  pooling: temporal_mean_spatial_flatten
+
+mask:
+  strategy: random_body_segment
+  allow_overlap: false
+  num_enc_masks: 1
+  num_pred_masks: 4
+  pred_frame_mask_ratio: [0.15, 0.25]
+  body_mask_ratio: [0.1428571429, 0.4285714286]
+
+meta:
+  seed: 0
+  load_checkpoint: false
+  read_checkpoint: null
+  model_name: mot_patch_tiny_2d
+  predictor_name: mot_predictor_patch_tiny_2d
+  use_bfloat16: true
+  use_float16: false
+
+optimization:
+  ema: [0.996, 1.0]
+  epochs: 300
+  final_lr: 1.0e-6
+  final_weight_decay: 0.4
+  ipe_scale: 1.0
+  lr: 0.0005
+  start_lr: 0.0001
+  warmup: 40
+  weight_decay: 0.04
+  clip_grad: 1.0

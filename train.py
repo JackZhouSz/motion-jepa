@@ -31,6 +31,7 @@ from mask import (
     PatchBodyRegionSegmentMaskCollator2D,
     PatchMaskCollator1D,
     PatchMaskCollator2D,
+    PatchRandomBodySegmentMaskCollator2D,
 )
 from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from mask.utils import (
@@ -105,18 +106,21 @@ def _write_tensorboard_linear_probe(
     *,
     global_step: int,
     summary: dict,
-    best_val_top1: float,
+    best_val_top1: float | None,
 ) -> None:
     if writer is None:
         return
     scalars = {
-        "linear_probe/val_top1_accuracy": float(
-            summary["best_val"]["top1_accuracy"]
-        ),
-        "linear_probe/test_top1_accuracy": float(summary["test"]["top1_accuracy"]),
-        "linear_probe/best_val_top1_accuracy": float(best_val_top1),
-        "linear_probe/probe_best_epoch": float(summary["best_epoch"]),
+        f"linear_probe/test_{name}": float(value)
+        for name, value in summary["test"].items()
     }
+    if summary.get("validation_used", True):
+        scalars["linear_probe/val_top1_accuracy"] = float(
+            summary["best_val"]["top1_accuracy"]
+        )
+        assert best_val_top1 is not None
+        scalars["linear_probe/best_val_top1_accuracy"] = float(best_val_top1)
+        scalars["linear_probe/probe_best_epoch"] = float(summary["best_epoch"])
     for name, value in scalars.items():
         writer.add_scalar(name, value, global_step)
     writer.flush()
@@ -287,6 +291,35 @@ def _load_checkpoint(
 def _build_mask_collator(args: dict, layout: TokenLayout):
     mask = args["mask"]
     strategy = str(mask.get("strategy", "multiblock"))
+    if strategy == "random_body_segment":
+        if layout.kind != "2d" or not layout.patchified:
+            raise ValueError(
+                "mask.strategy='random_body_segment' requires patchified 2D tokens"
+            )
+        patch = args["patch"]
+        if str(patch["spatial_grouping"]) != "coarse7":
+            raise ValueError(
+                "mask.strategy='random_body_segment' requires spatial_grouping='coarse7'"
+            )
+        if int(mask["num_enc_masks"]) != 1:
+            raise ValueError(
+                "mask.strategy='random_body_segment' requires one encoder mask"
+            )
+        if bool(mask["allow_overlap"]):
+            raise ValueError(
+                "mask.strategy='random_body_segment' requires allow_overlap=false"
+            )
+        return PatchRandomBodySegmentMaskCollator2D(
+            raw_num_frames=layout.raw_num_frames,
+            raw_num_joints=int(layout.raw_num_joints),
+            token_num_joints=int(layout.token_num_joints),
+            temporal_patch_size=layout.temporal_patch_size,
+            spatial_grouping=str(patch["spatial_grouping"]),
+            spatial_pooling=str(patch["spatial_pooling"]),
+            pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
+            body_mask_ratio=tuple(mask["body_mask_ratio"]),
+            npred=int(mask["num_pred_masks"]),
+        )
     if strategy == "body_region_segment":
         if layout.kind != "2d" or not layout.patchified:
             raise ValueError(
@@ -318,7 +351,8 @@ def _build_mask_collator(args: dict, layout: TokenLayout):
         )
     if strategy != "multiblock":
         raise ValueError(
-            f"Unknown mask.strategy {strategy!r}; choose one of: body_region_segment, multiblock"
+            f"Unknown mask.strategy {strategy!r}; choose one of: "
+            "body_region_segment, random_body_segment, multiblock"
         )
     common = dict(
         enc_frame_mask_ratio=tuple(mask["enc_frame_mask_ratio"]),
@@ -586,14 +620,19 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         probe_summary = _evaluate_online_probe_preserving_rng(
             online_linear_probe, target_encoder
         )
-        val_top1 = float(probe_summary["best_val"]["top1_accuracy"])
         test_top1 = float(probe_summary["test"]["top1_accuracy"])
         linear_probe_state["latest"] = {
             "pretrain_epoch": pretrain_epoch,
             "global_step": global_step,
             **probe_summary,
         }
-        improved = val_top1 > float(linear_probe_state["best_val_top1"])
+        validation_used = bool(probe_summary.get("validation_used", True))
+        val_top1 = (
+            float(probe_summary["best_val"]["top1_accuracy"])
+            if validation_used
+            else None
+        )
+        improved = validation_used and val_top1 > float(linear_probe_state["best_val_top1"])
         if improved:
             linear_probe_state["best_val_top1"] = val_top1
             linear_probe_state["best_epoch"] = pretrain_epoch
@@ -601,17 +640,29 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             tensorboard_writer,
             global_step=global_step,
             summary=probe_summary,
-            best_val_top1=float(linear_probe_state["best_val_top1"]),
+            best_val_top1=(
+                float(linear_probe_state["best_val_top1"])
+                if validation_used
+                else None
+            ),
         )
-        logger.info(
-            "epoch=%d linear_probe val_top1=%.4f test_top1=%.4f "
-            "best_val_top1=%.4f best_epoch=%s",
-            pretrain_epoch,
-            val_top1,
-            test_top1,
-            float(linear_probe_state["best_val_top1"]),
-            linear_probe_state["best_epoch"],
-        )
+        if validation_used:
+            logger.info(
+                "epoch=%d linear_probe val_top1=%.4f test_top1=%.4f "
+                "best_val_top1=%.4f best_epoch=%s",
+                pretrain_epoch,
+                val_top1,
+                test_top1,
+                float(linear_probe_state["best_val_top1"]),
+                linear_probe_state["best_epoch"],
+            )
+        else:
+            logger.info(
+                "epoch=%d linear_probe test_top1=%.4f selection=fixed_last_epoch "
+                "(diagnostic only)",
+                pretrain_epoch,
+                test_top1,
+            )
         return improved
 
     # Establish a frozen-encoder baseline before the first optimization step.

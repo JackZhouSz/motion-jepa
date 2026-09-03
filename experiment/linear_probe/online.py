@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,11 @@ class OnlineLinearProbe:
             raise FileNotFoundError(
                 f"Linear-probe dataset does not exist: {self.dataset_root}"
             )
+        dataset_metadata = json.loads(
+            (self.dataset_root / "meta.json").read_text(encoding="utf-8")
+        )
+        test_contents = dataset_metadata.get("test_contents", [])
+        self.test_content = test_contents[0] if len(test_contents) == 1 else test_contents
 
         data_config = training_config["data"]
         meta_config = training_config["meta"]
@@ -86,19 +92,28 @@ class OnlineLinearProbe:
             raise ValueError("Online linear probe requires an eval-mode encoder")
         if any(parameter.requires_grad for parameter in encoder.parameters()):
             raise ValueError("Online linear probe requires a frozen encoder")
-        caches = {
-            split: extract_features(
-                encoder,
-                self.datasets[split],
-                device=self.device,
-                batch_size=self.feature_batch_size,
-                num_workers=self.num_workers,
-                use_bfloat16=self.use_bfloat16,
-                show_progress=False,
-                pooling=self.pooling,
-            )
-            for split in SPLITS
-        }
+        caches = {}
+        feature_dim = int(encoder.embed_dim)
+        if self.pooling != GLOBAL_MEAN_POOLING:
+            feature_dim *= int(encoder.token_layout.token_num_joints)
+        for split in SPLITS:
+            if len(self.datasets[split]) == 0:
+                caches[split] = {
+                    "features": torch.empty((0, feature_dim), dtype=torch.float32),
+                    "labels": torch.empty((0,), dtype=torch.long),
+                    "sample_ids": [],
+                }
+            else:
+                caches[split] = extract_features(
+                    encoder,
+                    self.datasets[split],
+                    device=self.device,
+                    batch_size=self.feature_batch_size,
+                    num_workers=self.num_workers,
+                    use_bfloat16=self.use_bfloat16,
+                    show_progress=False,
+                    pooling=self.pooling,
+                )
         summary = train_linear_probe(
             caches,
             output=None,
@@ -129,6 +144,7 @@ class OnlineLinearProbe:
         if any(parameter.grad is not None for parameter in encoder.parameters()):
             raise RuntimeError("Online linear probe accumulated encoder gradients")
         summary["pooling"] = self.pooling
+        summary["test_content"] = self.test_content
         return summary
 
 

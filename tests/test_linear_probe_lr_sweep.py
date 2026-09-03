@@ -17,6 +17,13 @@ from test_linear_probe import _write_checkpoint, _write_dataset
 
 
 class SweepUnitTest(unittest.TestCase):
+    def test_validation_free_dataset_rejects_lr_sweep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_dataset(root, validation_enabled=False)
+            with self.assertRaisesRegex(ValueError, "validation-free"):
+                sweep.require_validation_dataset(root)
+
     def test_model_size_ordering_uses_encoder_then_predictor(self):
         run_names = [
             "mot_small-base_1d-bs.512-ep.300",

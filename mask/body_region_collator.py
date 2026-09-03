@@ -226,8 +226,168 @@ class PatchBodyRegionSegmentMaskCollator2D(_StatefulMaskCollator):
         return collated_batch, [torch.stack(contexts)], [torch.stack(targets)]
 
 
+class PatchRandomBodySegmentMaskCollator2D(_StatefulMaskCollator):
+    """Sample several temporal segments over uniformly random coarse7 groups."""
+
+    def __init__(
+        self,
+        raw_num_frames: int,
+        raw_num_joints: int,
+        token_num_joints: int,
+        temporal_patch_size: int = 3,
+        spatial_grouping: str = "coarse7",
+        spatial_pooling: str = "graph_mean",
+        pred_frame_mask_ratio: tuple[float, float] = (0.15, 0.25),
+        body_mask_ratio: tuple[float, float] = (1.0 / 7.0, 3.0 / 7.0),
+        npred: int = 4,
+    ) -> None:
+        super().__init__()
+        if spatial_grouping != "coarse7":
+            raise ValueError(
+                "random_body_segment requires spatial_grouping='coarse7'"
+            )
+        if spatial_pooling != "graph_mean":
+            raise ValueError(
+                "random_body_segment supports only spatial_pooling='graph_mean'"
+            )
+        if int(raw_num_joints) != 30 or int(token_num_joints) != 7:
+            raise ValueError("random_body_segment requires SOMA30 pooled to coarse7")
+
+        self.layout = TokenLayout(
+            kind="2d",
+            patchified=True,
+            raw_num_frames=int(raw_num_frames),
+            token_num_frames=int(raw_num_frames) // int(temporal_patch_size),
+            temporal_patch_size=int(temporal_patch_size),
+            raw_num_joints=int(raw_num_joints),
+            token_num_joints=int(token_num_joints),
+        )
+        self.pred_frame_mask_ratio = tuple(
+            float(value) for value in pred_frame_mask_ratio
+        )
+        self.body_mask_ratio = tuple(float(value) for value in body_mask_ratio)
+        self.npred = int(npred)
+        if self.npred <= 0:
+            raise ValueError("npred must be positive")
+        _sample_ratio(torch.Generator().manual_seed(0), self.pred_frame_mask_ratio)
+        _sample_ratio(torch.Generator().manual_seed(0), self.body_mask_ratio)
+        if self.body_mask_ratio[0] <= 0.0:
+            raise ValueError("body_mask_ratio must select at least one body group")
+
+        self._configuration = {
+            "variant": "patch_2d_random_body_segment",
+            "raw_num_frames": self.layout.raw_num_frames,
+            "token_num_frames": self.layout.token_num_frames,
+            "temporal_patch_size": self.layout.temporal_patch_size,
+            "raw_num_joints": self.layout.raw_num_joints,
+            "token_num_joints": self.layout.token_num_joints,
+            "spatial_grouping": str(spatial_grouping),
+            "spatial_pooling": str(spatial_pooling),
+            "pred_frame_mask_ratio": self.pred_frame_mask_ratio,
+            "body_mask_ratio": self.body_mask_ratio,
+            "npred": self.npred,
+        }
+
+    def __call__(self, batch):
+        collated_batch = torch.utils.data.default_collate(batch)
+        generator = torch.Generator().manual_seed(self.step())
+        raw_lengths = torch.tensor(
+            [
+                int(sample[2]) if len(sample) >= 3 else self.layout.raw_num_frames
+                for sample in batch
+            ],
+            dtype=torch.long,
+        )
+        token_lengths = self.layout.valid_token_lengths(raw_lengths)
+        if (token_lengths < 1).any():
+            raise ValueError(
+                "Every sample must contain at least one complete temporal patch"
+            )
+        valid_lengths = _valid_lengths(
+            [(None, None, int(length)) for length in token_lengths.tolist()],
+            self.layout.token_num_frames,
+        )
+        shortest = min(valid_lengths)
+
+        # All prediction masks share one sampled shape because the predictor
+        # concatenates them on the batch axis and therefore requires an equal
+        # target-token count. Their positions and body-group identities remain
+        # independently sampled.
+        shape = (
+            _block_length(
+                shortest,
+                _sample_ratio(generator, self.pred_frame_mask_ratio),
+            ),
+            _block_length(
+                self.layout.token_num_joints,
+                _sample_ratio(generator, self.body_mask_ratio),
+            ),
+        )
+        shapes = [shape] * self.npred
+
+        contexts_by_sample = []
+        targets_by_sample = []
+        for valid_length in valid_lengths:
+            if sum(frames * groups for frames, groups in shapes) >= valid_length * 7:
+                raise ValueError(
+                    "random-body target masks leave no context cells; reduce "
+                    "num_pred_masks or mask ratios"
+                )
+
+            for _union_attempt in range(256):
+                targets = []
+                target_union = torch.zeros(
+                    self.layout.token_num_frames,
+                    self.layout.token_num_joints,
+                    dtype=torch.bool,
+                )
+                complete = True
+                for frame_count, group_count in shapes:
+                    for _target_attempt in range(256):
+                        start = int(
+                            torch.randint(
+                                valid_length - frame_count + 1,
+                                (),
+                                generator=generator,
+                            ).item()
+                        )
+                        groups = torch.randperm(
+                            self.layout.token_num_joints, generator=generator
+                        )[:group_count]
+                        proposal = torch.zeros_like(target_union)
+                        proposal[start : start + frame_count, groups] = True
+                        if not (target_union & proposal).any():
+                            targets.append(proposal)
+                            target_union |= proposal
+                            break
+                    else:
+                        complete = False
+                        break
+                if complete:
+                    break
+            else:
+                raise ValueError(
+                    "Could not sample cell-disjoint random-body target masks; "
+                    "reduce num_pred_masks or mask ratios"
+                )
+
+            valid = (
+                torch.arange(self.layout.token_num_frames)[:, None] < valid_length
+            ).expand(-1, self.layout.token_num_joints)
+            contexts_by_sample.append(valid & ~target_union)
+            targets_by_sample.append(targets)
+
+        contexts = [torch.stack(contexts_by_sample)]
+        targets = [
+            torch.stack([sample[index] for sample in targets_by_sample])
+            for index in range(self.npred)
+        ]
+        return collated_batch, contexts, targets
+
+
 __all__ = [
     "COARSE7_GRAPH_EDGES",
     "COARSE7_GROUP_NAMES",
     "PatchBodyRegionSegmentMaskCollator2D",
+    "PatchRandomBodySegmentMaskCollator2D",
 ]
