@@ -1,12 +1,14 @@
-"""Frozen-feature linear probing and shared 100STYLE dataset utilities."""
+"""Frozen-feature linear probing and classification dataset utilities."""
 
 from .dataset import (
-    StyleLabelIndex,
-    StyleMotionDataset,
-    StyleTokenDataset,
-    build_style_datasets,
-    load_style_index,
-    load_style_label_index,
+    ClassificationLabelIndex,
+    ClassificationTokenDataset,
+    MultiLabelIndex,
+    MultiLabelMotionDataset,
+    SingleLabelIndex,
+    SingleLabelMotionDataset,
+    build_classification_datasets,
+    load_classification_label_index,
 )
 from .cnn import MotionCNNClassifier
 from .features import (
@@ -36,16 +38,18 @@ __all__ = [
     "MotionCNNClassifier",
     "RawMotionLinearClassifier",
     "MotionTransformerClassifier",
-    "StyleLabelIndex",
-    "StyleMotionDataset",
-    "StyleTokenDataset",
+    "ClassificationLabelIndex",
+    "ClassificationTokenDataset",
+    "MultiLabelIndex",
+    "MultiLabelMotionDataset",
+    "SingleLabelIndex",
+    "SingleLabelMotionDataset",
     "build_cache_metadata",
-    "build_style_datasets",
+    "build_classification_datasets",
     "extract_features",
     "load_frozen_encoder",
     "load_or_extract_split",
-    "load_style_index",
-    "load_style_label_index",
+    "load_classification_label_index",
     "pool_encoder_output",
     "resolve_device",
     "resolve_pretraining_stats",

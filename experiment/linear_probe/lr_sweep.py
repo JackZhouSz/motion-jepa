@@ -29,7 +29,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from . import features  # noqa: E402
-from .dataset import build_style_datasets, load_style_label_index  # noqa: E402
+from .dataset import (  # noqa: E402
+    SingleLabelIndex,
+    SingleLabelMotionDataset,
+    build_classification_datasets,
+)
 from .train_probe import train_linear_probe  # noqa: E402
 
 
@@ -160,7 +164,7 @@ def load_or_extract_adaptive(
     split: str,
     cache_path: Path,
     metadata: dict[str, Any],
-    dataset: features.StyleMotionDataset,
+    dataset: SingleLabelMotionDataset,
     encoder: torch.nn.Module,
     device: torch.device,
     initial_batch_size: int,
@@ -221,24 +225,24 @@ def prepare_checkpoint_features(
         checkpoint_path, "target_encoder", device
     )
     stats_root = features.resolve_pretraining_stats(config, None)
-    label_index = load_style_label_index(dataset_root)
-    class_names = list(label_index.class_names)
-    datasets, _ = build_style_datasets(
+    datasets, label_index = build_classification_datasets(
         dataset_root,
         splits=features.SPLITS,
         num_frames=model_info["num_frames"],
         fps=model_info["fps"],
         motion_dim=model_info["motion_dim"],
         stats_root=stats_root,
-        label_index=label_index,
     )
+    if not isinstance(label_index, SingleLabelIndex):
+        raise ValueError("The top-1 LR sweep requires single-label classification data")
+    class_names = list(label_index.class_names)
     train_classes = set(datasets["train"].labels)
     if train_classes != set(range(len(class_names))):
         missing = [
             class_names[index]
             for index in sorted(set(range(len(class_names))) - train_classes)
         ]
-        raise ValueError(f"Training split is missing style classes: {missing}")
+        raise ValueError(f"Training split is missing classes: {missing}")
 
     cache_root = (
         checkpoint_path.parent / "linear-probe" / "features"
@@ -597,7 +601,7 @@ def write_readme(
     lookup = {(row["run_name"], float(row["lr"])): row for row in aggregates}
     multiple_seeds = len(seeds) > 1
     lines = [
-        "# 100STYLE Motion-JEPA Linear-Probe LR Sweep",
+        "# 100STYLE MotionJEPA Linear-Probe LR Sweep",
         "",
         "## Settings",
         "",

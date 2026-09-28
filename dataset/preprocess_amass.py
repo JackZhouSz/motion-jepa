@@ -1,4 +1,4 @@
-"""Preprocess fixed-identity AMASS SOMA77 BVHs into Motion-JEPA NPY windows."""
+"""Preprocess fixed-identity AMASS SOMA77 BVHs into MotionJEPA NPY windows."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Tests for frozen Motion-JEPA linear probing."""
+"""Tests for frozen MotionJEPA linear probing."""
 
 from __future__ import annotations
 
@@ -113,6 +113,7 @@ def _write_dataset(
     (root / "meta.json").write_text(
         json.dumps(
             {
+                "source_dataset": "100STYLE_soma77",
                 "representation": "motion_jepa_366_v1",
                 "motion_storage": "npy_float32_v1",
                 "motion_dim": motion_dim,
@@ -350,14 +351,14 @@ class LinearProbeEndToEndTest(unittest.TestCase):
             self.assertEqual(cache["metadata"]["checkpoint_key"], "target_encoder")
             self.assertTrue(torch.isfinite(cache["features"]).all())
 
-            dataset = linear_probe.StyleMotionDataset(
+            dataset = linear_probe.SingleLabelMotionDataset(
                 dataset_root,
                 "train",
                 num_frames=4,
                 fps=30,
                 motion_dim=6,
                 stats_root=pretrain_stats,
-                label_index=linear_probe.load_style_label_index(dataset_root),
+                label_index=linear_probe.load_classification_label_index(dataset_root),
             )
             motion, *_ = dataset[0]
             self.assertAlmostEqual(float(motion[0, 0]), -1.0)

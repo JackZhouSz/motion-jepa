@@ -1,4 +1,4 @@
-"""Online collapse and held-out JEPA diagnostics for Motion-JEPA pretraining."""
+"""Online collapse and held-out JEPA diagnostics for MotionJEPA pretraining."""
 
 from __future__ import annotations
 

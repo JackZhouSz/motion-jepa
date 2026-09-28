@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -42,7 +43,11 @@ def _environment_rank() -> tuple[int, int, int]:
     return 0, 1, 0
 
 
-def init_distributed(device: torch.device, port: int = 40112) -> DistributedContext:
+def init_distributed(
+    device: torch.device,
+    port: int = 40112,
+    timeout_seconds: int | None = None,
+) -> DistributedContext:
     if dist.is_available() and dist.is_initialized():
         rank, world_size, local_rank = _environment_rank()
         return DistributedContext(rank, world_size, local_rank, dist.get_backend())
@@ -52,7 +57,10 @@ def init_distributed(device: torch.device, port: int = 40112) -> DistributedCont
     backend = "nccl" if device.type == "cuda" else "gloo"
     os.environ.setdefault("MASTER_ADDR", socket.gethostname())
     os.environ.setdefault("MASTER_PORT", str(port))
-    dist.init_process_group(backend=backend, init_method="env://")
+    kwargs = {"backend": backend, "init_method": "env://"}
+    if timeout_seconds is not None:
+        kwargs["timeout"] = timedelta(seconds=timeout_seconds)
+    dist.init_process_group(**kwargs)
     return DistributedContext(rank, world_size, local_rank, backend)
 
 

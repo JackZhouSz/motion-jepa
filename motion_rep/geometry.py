@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Rotation, velocity, and feature-space helpers for Motion-JEPA."""
+"""Rotation, velocity, and feature-space helpers for MotionJEPA."""
 
 from __future__ import annotations
 

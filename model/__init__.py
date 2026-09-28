@@ -1,4 +1,4 @@
-"""Public Motion-JEPA model variants and named factories."""
+"""Public MotionJEPA model variants and named factories."""
 
 from .motion_transformer_1d import (
     MotionTransformer1D,

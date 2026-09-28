@@ -1,4 +1,4 @@
-"""Regression tests for the independent Motion-JEPA motion package."""
+"""Regression tests for the independent MotionJEPA motion package."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Local and torchrun entry point for Motion-JEPA pretraining."""
+"""Local and torchrun entry point for MotionJEPA pretraining."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from utils.distributed import cleanup_distributed
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train Motion-JEPA")
+    parser = argparse.ArgumentParser(description="Train MotionJEPA")
     parser.add_argument(
         "--config", "--fname",
         dest="config",

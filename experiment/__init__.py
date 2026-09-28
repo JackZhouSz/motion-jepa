@@ -1,1 +1,1 @@
-"""Downstream experiments for Motion-JEPA representations."""
+"""Downstream experiments for MotionJEPA representations."""

@@ -1,4 +1,4 @@
-"""Frozen Motion-JEPA encoder loading, feature extraction, and cache utilities."""
+"""Frozen MotionJEPA encoder loading, feature extraction, and cache utilities."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
@@ -25,9 +25,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from helper import init_mjepa_encoder_from_config  # noqa: E402
-
-from .dataset import StyleMotionDataset  # noqa: E402
-
 
 SPLITS = ("train", "val", "test")
 CACHE_FORMAT_VERSION = 1
@@ -127,7 +124,7 @@ def load_frozen_encoder(
     """Reconstruct an encoder from checkpoint config and strictly load its weights."""
     checkpoint = _torch_load_checkpoint(checkpoint_path)
     if checkpoint.get("format_version") != 1:
-        raise ValueError(f"Unsupported Motion-JEPA checkpoint format: {checkpoint_path}")
+        raise ValueError(f"Unsupported MotionJEPA checkpoint format: {checkpoint_path}")
     if checkpoint_key not in checkpoint:
         raise KeyError(f"Checkpoint has no {checkpoint_key!r} weights: {checkpoint_path}")
     config = checkpoint.get("config")
@@ -313,7 +310,7 @@ def _validate_feature_cache(payload: dict[str, Any], expected: dict[str, Any]) -
 
 def extract_features(
     encoder: nn.Module,
-    dataset: StyleMotionDataset,
+    dataset: Dataset,
     *,
     device: torch.device,
     batch_size: int,
@@ -357,7 +354,7 @@ def extract_features(
                     encoded, length, encoder.token_layout, pooling=pooling
                 )
             feature_batches.append(pooled.float().cpu())
-            label_batches.append(labels.to(dtype=torch.long).cpu())
+            label_batches.append(labels.cpu())
             sample_ids.extend(list(ids))
     if not feature_batches:
         raise ValueError("Cannot extract features from an empty split")
@@ -373,7 +370,7 @@ def load_or_extract_split(
     split: str,
     cache_path: Path,
     metadata: dict[str, Any],
-    dataset: StyleMotionDataset,
+    dataset: Dataset,
     encoder: nn.Module,
     device: torch.device,
     batch_size: int,

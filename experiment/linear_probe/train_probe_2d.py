@@ -1,4 +1,4 @@
-"""Group-aware frozen linear probing for 2D Motion-JEPA encoders."""
+"""Group-aware frozen linear probing for 2D MotionJEPA encoders."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .train_probe import build_parser, run
 def main() -> None:
     parser = build_parser()
     parser.description = (
-        "2D Motion-JEPA linear probe: temporal mean, spatial flatten, one Linear head"
+        "2D MotionJEPA linear probe: temporal mean, spatial flatten, one Linear head"
     )
     parser.set_defaults(pooling=SPATIAL_FLATTEN_POOLING)
     summary = run(parser.parse_args())

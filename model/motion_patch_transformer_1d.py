@@ -1,4 +1,4 @@
-"""Non-overlapping temporal-patch Motion-JEPA encoder and predictor."""
+"""Non-overlapping temporal-patch MotionJEPA encoder and predictor."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from mask.utils import apply_index_masks, repeat_mask_blocks
 
-from .modules import TransformerBlock1D, initialize_transformer
+from .modules import TransformerBlock1D, _make_safe_attention_mask, initialize_transformer
 from .pos_embs import ContinuousSinCosPosEmbed1D
 from .specs import MODEL_SPECS, PREDICTOR_SPECS
 from .token_layout import TokenLayout
@@ -140,8 +140,9 @@ class MotionPatchTransformer1D(nn.Module):
             active = None
         elif active is not None:
             x = x * active.unsqueeze(-1).to(dtype=x.dtype)
+        attention_active = _make_safe_attention_mask(active) if active is not None else None
         for block in self.blocks:
-            x = block(x, active)
+            x = block(x, attention_active)
         x = self.norm(x)
         if active is not None:
             x = x * active.unsqueeze(-1).to(dtype=x.dtype)

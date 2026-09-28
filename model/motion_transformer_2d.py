@@ -1,4 +1,4 @@
-"""Skeletal-temporal Motion-JEPA encoder and predictor."""
+"""Skeletal-temporal MotionJEPA encoder and predictor."""
 
 from __future__ import annotations
 

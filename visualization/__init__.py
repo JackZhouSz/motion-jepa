@@ -1,4 +1,4 @@
-"""Interactive Motion-JEPA visualization."""
+"""Interactive MotionJEPA visualization."""
 
 from .dataset_viewer import (
     MotionEntry,

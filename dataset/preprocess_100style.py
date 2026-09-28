@@ -584,7 +584,7 @@ def preprocess(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert 100STYLE SOMA77 BVHs to shuffled Motion-JEPA NPY windows."
+        description="Convert 100STYLE SOMA77 BVHs to shuffled MotionJEPA NPY windows."
     )
     parser.add_argument(
         "--dataset_root",

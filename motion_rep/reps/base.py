@@ -1,4 +1,4 @@
-"""Base class for Motion-JEPA feature representations."""
+"""Base class for MotionJEPA feature representations."""
 
 from abc import ABC, abstractmethod
 

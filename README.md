@@ -1,9 +1,9 @@
-# Motion-JEPA
+# MotionJEPA
 
-Motion-JEPA learns motion representations by predicting target embeddings from
+MotionJEPA learns motion representations by predicting target embeddings from
 masked context embeddings. The repository contains a self-contained BONES-SEED
 preprocessing pipeline, the `motion_jepa_366_v1` SOMA30 representation, two
-Motion-JEPA transformer variants, distributed pretraining, and visualization.
+MotionJEPA transformer variants, distributed pretraining, and visualization.
 
 The code does not require the Ardy or Kimodo repositories at runtime.
 
@@ -311,6 +311,18 @@ not create `<write_tag>-best-accuracy.pth.tar` and do not select a pretraining
 checkpoint; use latest or a named epoch checkpoint for final comparison.
 Linear probing is disabled when the section is absent or `enabled: false`.
 
+For BABEL-60 and BABEL-120 online probing, use `linear_probe.datasets` instead
+of `dataset_root`. The active `configs/mjepa_patch_1d_base.yaml` evaluates both
+datasets before training, every 10 epochs, and at the final epoch. Each probe
+fits a fresh 50-epoch SGD linear head on frozen EMA features with multi-label
+BCE, selects the head by validation mAP, and records validation metrics under
+`linear_probe/babel-60/*` and `linear_probe/babel-120/*`. BABEL has no labeled
+test split. The best pretraining checkpoints are saved separately as
+`<write_tag>-best-babel-60-map.pth.tar` and
+`<write_tag>-best-babel-120-map.pth.tar`; probe results and both best scores
+resume from the latest checkpoint. The existing single-dataset `dataset_root`
+configuration continues to use the 100STYLE probe.
+
 Sweep every direct-child latest checkpoint with:
 
 ```bash
@@ -371,7 +383,7 @@ evaluates `FW` once. The equivalent shared-runner command is
 `python -m experiment.linear_probe.train_classifier --model linear ...`.
 
 The same classifiers can consume frozen frame-token features from a pretrained
-1D Motion-JEPA target encoder:
+1D MotionJEPA target encoder:
 
 ```bash
 python -m experiment.linear_probe.train_classifier \
@@ -417,7 +429,7 @@ execution cannot be exercised locally.
 
 ## Attribution
 
-Motion-JEPA includes modified Apache-2.0 portions and assets derived from NVIDIA
+MotionJEPA includes modified Apache-2.0 portions and assets derived from NVIDIA
 Ardy and Kimodo. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
 [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt).
 

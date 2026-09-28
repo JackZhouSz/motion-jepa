@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render Motion-JEPA raw or patchified 1D/2D masks as a PNG."""
+"""Render MotionJEPA raw or patchified 1D/2D masks as a PNG."""
 
 from __future__ import annotations
 
@@ -204,7 +204,7 @@ def _header(
     geometry = f"tokens={layout.token_num_frames}"
     if layout.kind == "2d":
         geometry += f"x{layout.token_num_joints}"
-    draw.text((left, 22), "Motion-JEPA mask coverage", fill=TEXT, font=_font(28, True))
+    draw.text((left, 22), "MotionJEPA mask coverage", fill=TEXT, font=_font(28, True))
     draw.text(
         (left, 65),
         f"model={sampled.model_name}   layout={layout.kind}   "

@@ -1,4 +1,4 @@
-"""Skeleton definitions and utilities used across Motion-JEPA."""
+"""Skeleton definitions and utilities used across MotionJEPA."""
 
 from .base import SkeletonBase
 from .bvh import parse_bvh_motion

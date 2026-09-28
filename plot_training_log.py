@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot one or more Motion-JEPA CSV training logs."""
+"""Plot one or more MotionJEPA CSV training logs."""
 
 from __future__ import annotations
 

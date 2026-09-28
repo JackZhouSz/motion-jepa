@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Small, self-contained BVH reader used by Motion-JEPA."""
+"""Small, self-contained BVH reader used by MotionJEPA."""
 
 from __future__ import annotations
 

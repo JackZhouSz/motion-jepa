@@ -1,4 +1,4 @@
-"""Deterministic structured mask collators for Motion-JEPA."""
+"""Deterministic structured mask collators for MotionJEPA."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Motion-JEPA pretraining loop shared by the 1D and 2D variants."""
+"""MotionJEPA pretraining loop shared by the 1D and 2D variants."""
 
 from __future__ import annotations
 
@@ -128,6 +128,32 @@ def _write_tensorboard_linear_probe(
     writer.flush()
 
 
+def _write_tensorboard_babel_probes(
+    writer,
+    *,
+    global_step: int,
+    summaries: dict[str, dict],
+    state: dict[str, dict],
+) -> None:
+    if writer is None:
+        return
+    for name, summary in summaries.items():
+        prefix = f"linear_probe/{name}"
+        for metric, value in summary["best_val"].items():
+            writer.add_scalar(f"{prefix}/val_{metric}", float(value), global_step)
+        writer.add_scalar(
+            f"{prefix}/best_val_mean_average_precision",
+            float(state[name]["best_val_map"]), global_step,
+        )
+        writer.add_scalar(
+            f"{prefix}/probe_best_epoch", float(summary["best_epoch"]), global_step,
+        )
+        writer.add_scalar(
+            f"{prefix}/pretrain_best_epoch", float(state[name]["best_epoch"]), global_step,
+        )
+    writer.flush()
+
+
 def _flatten_numeric_metrics(prefix: str, values: dict) -> dict[str, float]:
     flattened: dict[str, float] = {}
     for name, value in values.items():
@@ -238,6 +264,7 @@ def _save_checkpoint(
     linear_probe_latest: dict | None = None,
     best_probe_val_top1: float = float("-inf"),
     best_probe_epoch: int | None = None,
+    babel_probe_state: dict[str, dict] | None = None,
     online_metrics_latest: dict | None = None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
@@ -264,6 +291,7 @@ def _save_checkpoint(
         "linear_probe_latest": linear_probe_latest,
         "best_probe_val_top1": float(best_probe_val_top1),
         "best_probe_epoch": best_probe_epoch,
+        "babel_probe_state": babel_probe_state,
         "online_metrics_latest": online_metrics_latest,
     }
     if architecture is not None:
@@ -288,6 +316,7 @@ def _load_checkpoint(
     world_size: int,
     architecture: dict | None = None,
     linear_probe_state: dict | None = None,
+    babel_probe_state: dict[str, dict] | None = None,
     online_metrics_state: dict | None = None,
 ) -> tuple[int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
@@ -295,7 +324,7 @@ def _load_checkpoint(
     # PyTorch 2.6 defaults weights_only=True, which cannot restore that payload.
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("format_version") != 1:
-        raise ValueError(f"Unsupported Motion-JEPA checkpoint format: {path}")
+        raise ValueError(f"Unsupported MotionJEPA checkpoint format: {path}")
     if int(checkpoint["world_size"]) != world_size:
         raise ValueError(
             f"Exact resume requires world_size={checkpoint['world_size']}, got {world_size}"
@@ -328,6 +357,10 @@ def _load_checkpoint(
             best_val_top1=float(checkpoint.get("best_probe_val_top1", float("-inf"))),
             best_epoch=checkpoint.get("best_probe_epoch"),
         )
+    if babel_probe_state is not None:
+        saved = checkpoint.get("babel_probe_state") or {}
+        for name, state in babel_probe_state.items():
+            state.update(saved.get(name, {}))
     if online_metrics_state is not None:
         online_metrics_state["latest"] = checkpoint.get("online_metrics_latest")
     return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
@@ -489,7 +522,15 @@ def _seed_all(seed: int, device: torch.device) -> None:
 
 def main(args: dict, resume_preempt: bool = False, device=None):
     device = _resolve_device(device)
-    distributed = init_distributed(device)
+    probe_configuration = args.get("linear_probe", {})
+    babel_probe_requested = (
+        isinstance(probe_configuration, dict)
+        and bool(probe_configuration.get("enabled", False))
+        and "datasets" in probe_configuration
+    )
+    distributed = init_distributed(
+        device, timeout_seconds=4 * 60 * 60 if babel_probe_requested else None
+    )
     rank, world_size = distributed.rank, distributed.world_size
     if rank != 0:
         logger.setLevel(logging.ERROR)
@@ -508,6 +549,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     if not isinstance(probe_args, dict):
         raise ValueError("linear_probe config must be a mapping")
     probe_enabled = bool(probe_args.get("enabled", False))
+    babel_probe_enabled = probe_enabled and "datasets" in probe_args
     metric_args = args.get("online_metrics", {})
     if not isinstance(metric_args, dict):
         raise ValueError("online_metrics config must be a mapping")
@@ -519,10 +561,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         raise ValueError("linear_probe.frequency must be positive")
     model_name = str(meta_args["model_name"])
     if model_name not in MODEL_FACTORIES:
-        raise ValueError(f"Unknown Motion-JEPA model_name: {model_name!r}")
+        raise ValueError(f"Unknown MotionJEPA model_name: {model_name!r}")
     predictor_name = str(meta_args["predictor_name"])
     if predictor_name not in PREDICTOR_FACTORIES:
-        raise ValueError(f"Unknown Motion-JEPA predictor_name: {predictor_name!r}")
+        raise ValueError(f"Unknown MotionJEPA predictor_name: {predictor_name!r}")
 
     output = Path(log_args["folder"])
     resume_requested = bool(meta_args.get("load_checkpoint", False) or resume_preempt)
@@ -597,6 +639,13 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         "best_val_top1": float("-inf"),
         "best_epoch": None,
     }
+    babel_probe_state = (
+        {
+            name: {"latest": None, "best_val_map": float("-inf"), "best_epoch": None}
+            for name in ("babel-60", "babel-120")
+        }
+        if babel_probe_enabled else None
+    )
     online_metrics_state = {"latest": None}
     latest_path = output / f"{log_args['write_tag']}-latest.pth.tar"
     best_accuracy_path = output / f"{log_args['write_tag']}-best-accuracy.pth.tar"
@@ -622,6 +671,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             world_size=world_size,
             architecture=architecture,
             linear_probe_state=linear_probe_state,
+            babel_probe_state=babel_probe_state,
             online_metrics_state=online_metrics_state,
         )
         logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
@@ -665,16 +715,28 @@ def main(args: dict, resume_preempt: bool = False, device=None):
 
     online_linear_probe = None
     if probe_enabled and distributed.is_main:
-        from experiment.linear_probe.online import OnlineLinearProbe
+        if babel_probe_enabled:
+            from experiment.linear_probe.online import OnlineBabelProbes
 
-        online_linear_probe = OnlineLinearProbe(args, probe_args, device=device)
-        logger.info(
-            "Enabled online linear probe on %s (epochs=%d, lr=%.3g, frequency=%d)",
-            online_linear_probe.dataset_root,
-            online_linear_probe.epochs,
-            online_linear_probe.learning_rate,
-            probe_frequency,
-        )
+            online_linear_probe = OnlineBabelProbes(args, probe_args, device=device)
+            logger.info(
+                "Enabled online BABEL-60 and BABEL-120 probes "
+                "(epochs=%d, lr=%.3g, frequency=%d)",
+                online_linear_probe.epochs,
+                online_linear_probe.learning_rate,
+                probe_frequency,
+            )
+        else:
+            from experiment.linear_probe.online import OnlineLinearProbe
+
+            online_linear_probe = OnlineLinearProbe(args, probe_args, device=device)
+            logger.info(
+                "Enabled online linear probe on %s (epochs=%d, lr=%.3g, frequency=%d)",
+                online_linear_probe.dataset_root,
+                online_linear_probe.epochs,
+                online_linear_probe.learning_rate,
+                probe_frequency,
+            )
 
     online_metrics = None
     if metrics_enabled and distributed.is_main:
@@ -710,14 +772,42 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     warmup = float(opt_args["warmup"])
     clip_grad = float(opt_args["clip_grad"]) if opt_args.get("clip_grad") is not None else None
 
-    def run_online_linear_probe(pretrain_epoch: int) -> bool:
+    def run_online_linear_probe(pretrain_epoch: int) -> tuple[bool, set[str]]:
         if not distributed.is_main:
-            return False
+            return False, set()
         if online_linear_probe is None:
             raise RuntimeError("Online linear probe was not initialized on rank 0")
         probe_summary = _evaluate_online_probe_preserving_rng(
             online_linear_probe, target_encoder
         )
+        if babel_probe_enabled:
+            assert babel_probe_state is not None
+            improved_names = set()
+            for name, summary in probe_summary.items():
+                score = float(summary["best_val"]["mean_average_precision"])
+                state = babel_probe_state[name]
+                state["latest"] = {
+                    "pretrain_epoch": pretrain_epoch,
+                    "global_step": global_step,
+                    **summary,
+                }
+                if score > float(state["best_val_map"]):
+                    state["best_val_map"] = score
+                    state["best_epoch"] = pretrain_epoch
+                    improved_names.add(name)
+                logger.info(
+                    "epoch=%d linear_probe %s val_mAP=%.4f "
+                    "best_val_mAP=%.4f best_epoch=%s",
+                    pretrain_epoch, name, score,
+                    float(state["best_val_map"]), state["best_epoch"],
+                )
+            _write_tensorboard_babel_probes(
+                tensorboard_writer,
+                global_step=global_step,
+                summaries=probe_summary,
+                state=babel_probe_state,
+            )
+            return False, improved_names
         test_top1 = float(probe_summary["test"]["top1_accuracy"])
         linear_probe_state["latest"] = {
             "pretrain_epoch": pretrain_epoch,
@@ -761,7 +851,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                 pretrain_epoch,
                 test_top1,
             )
-        return improved
+        return improved, set()
 
     def run_online_representation_metrics(pretrain_epoch: int) -> None:
         if not distributed.is_main:
@@ -797,14 +887,19 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     # A resumed epoch-0 checkpoint already contains this result, so do not
     # repeat the relatively expensive probe in that case.
     needs_initial_probe = (
-        probe_enabled and start_epoch == 0 and linear_probe_state["latest"] is None
+        probe_enabled and start_epoch == 0 and (
+            any(state["latest"] is None for state in babel_probe_state.values())
+            if babel_probe_state is not None
+            else linear_probe_state["latest"] is None
+        )
     )
     needs_initial_metrics = (
         metrics_enabled and start_epoch == 0 and online_metrics_state["latest"] is None
     )
     if needs_initial_probe or needs_initial_metrics:
-        initial_probe_improved = (
-            run_online_linear_probe(pretrain_epoch=0) if needs_initial_probe else False
+        initial_probe_improved, initial_babel_improved = (
+            run_online_linear_probe(pretrain_epoch=0)
+            if needs_initial_probe else (False, set())
         )
         if needs_initial_metrics:
             run_online_representation_metrics(pretrain_epoch=0)
@@ -829,10 +924,17 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             linear_probe_latest=linear_probe_state["latest"],
             best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
             best_probe_epoch=linear_probe_state["best_epoch"],
+            babel_probe_state=babel_probe_state,
             online_metrics_latest=online_metrics_state["latest"],
         )
         if distributed.is_main and initial_probe_improved:
             _atomic_copy(latest_path, best_accuracy_path)
+        if distributed.is_main:
+            for name in initial_babel_improved:
+                _atomic_copy(
+                    latest_path,
+                    output / f"{log_args['write_tag']}-best-{name}-map.pth.tar",
+                )
         barrier()
 
     # These meters span epoch boundaries and reset only after a log event, so
@@ -966,8 +1068,9 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
         )
         probe_improved = False
+        babel_improved: set[str] = set()
         if should_probe and distributed.is_main:
-            probe_improved = run_online_linear_probe(pretrain_epoch=epoch + 1)
+            probe_improved, babel_improved = run_online_linear_probe(pretrain_epoch=epoch + 1)
         should_measure = metrics_enabled and (
             (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
         )
@@ -995,6 +1098,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             linear_probe_latest=linear_probe_state["latest"],
             best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
             best_probe_epoch=linear_probe_state["best_epoch"],
+            babel_probe_state=babel_probe_state,
             online_metrics_latest=online_metrics_state["latest"],
         )
         if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
@@ -1005,6 +1109,12 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             _atomic_copy(latest_path, checkpoint_path)
         if distributed.is_main and probe_improved:
             _atomic_copy(latest_path, best_accuracy_path)
+        if distributed.is_main:
+            for name in babel_improved:
+                _atomic_copy(
+                    latest_path,
+                    output / f"{log_args['write_tag']}-best-{name}-map.pth.tar",
+                )
         barrier()
         logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
 

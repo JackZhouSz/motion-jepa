@@ -1,4 +1,4 @@
-"""Token-grid geometry shared by Motion-JEPA models and data plumbing."""
+"""Token-grid geometry shared by MotionJEPA models and data plumbing."""
 
 from __future__ import annotations
 

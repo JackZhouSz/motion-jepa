@@ -15,7 +15,7 @@ import torch
 
 from experiment.linear_probe import train_classifier
 from experiment.linear_probe.dataset import (
-    BabelLabelIndex,
+    MultiLabelIndex,
     build_classification_datasets,
 )
 from test_linear_probe import _write_checkpoint, _write_dataset
@@ -94,7 +94,7 @@ class BabelClassifierTest(unittest.TestCase):
             datasets, index = build_classification_datasets(
                 root, num_frames=4, fps=30, motion_dim=6, stats_root=root / "stats",
             )
-            self.assertIsInstance(index, BabelLabelIndex)
+            self.assertIsInstance(index, MultiLabelIndex)
             self.assertEqual((len(datasets["train"]), len(datasets["val"]), len(datasets["test"])), (4, 2, 0))
             self.assertEqual(index.num_classes, 60)
             targets = {sample_id: label for label, sample_id in zip(

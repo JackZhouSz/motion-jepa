@@ -1,4 +1,4 @@
-"""Shared transformer building blocks for Motion-JEPA models."""
+"""Shared transformer building blocks for MotionJEPA models."""
 
 from __future__ import annotations
 

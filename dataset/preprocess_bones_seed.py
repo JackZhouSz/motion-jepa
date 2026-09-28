@@ -607,7 +607,7 @@ def preprocess(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert BONES-SEED SOMA BVHs to Motion-JEPA NPY clips."
+        description="Convert BONES-SEED SOMA BVHs to MotionJEPA NPY clips."
     )
     parser.add_argument(
         "--dataset_root",

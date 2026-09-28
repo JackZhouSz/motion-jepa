@@ -1,4 +1,4 @@
-"""Validated, lazy NPY Motion-JEPA dataset loader."""
+"""Validated, lazy NPY MotionJEPA dataset loader."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ class MotionDataset(torch.utils.data.Dataset):
     def _validate_dataset_metadata(self) -> None:
         path = self.root_path / "meta.json"
         if not path.is_file():
-            raise FileNotFoundError(f"Motion-JEPA dataset metadata does not exist: {path}")
+            raise FileNotFoundError(f"MotionJEPA dataset metadata does not exist: {path}")
         metadata = json.loads(path.read_text(encoding="utf-8"))
         if "min_frames" in metadata:
             self.dataset_min_frames = int(metadata["min_frames"])
@@ -256,7 +256,7 @@ def make_motion_dataset(
         stats_path=stats_path,
     )
     if not dataset:
-        raise ValueError(f"No valid Motion-JEPA samples found under {root_path}")
+        raise ValueError(f"No valid MotionJEPA samples found under {root_path}")
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset,
         num_replicas=world_size,

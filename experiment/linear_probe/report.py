@@ -225,7 +225,7 @@ def _plot_fixed_lr_model_comparison(
     axis.set_yticklabels(labels)
     axis.invert_yaxis()
     axis.set_xlabel("Top-1 accuracy (%)")
-    axis.set_title(f"Motion-JEPA linear probes at LR {lr:g}")
+    axis.set_title(f"MotionJEPA linear probes at LR {lr:g}")
     axis.set_xlim(max(0.0, min(validation + test) - 5.0), 100.0)
     axis.grid(axis="x", alpha=0.25)
     axis.legend()
@@ -298,7 +298,7 @@ def build_readme(
     lines = [
         "# 100STYLE Classification Evaluation",
         "",
-        "This report compares frozen Motion-JEPA linear probes with supervised raw-motion CNN and CLS-Transformer classifiers. All values were regenerated from the current experiment artifacts; no historical metrics are reused.",
+        "This report compares frozen MotionJEPA linear probes with supervised raw-motion CNN and CLS-Transformer classifiers. All values were regenerated from the current experiment artifacts; no historical metrics are reused.",
         "",
         "## Evaluation protocol",
         "",
@@ -336,11 +336,11 @@ def build_readme(
         "",
         "## Linear-probe sweep",
         "",
-        f"The sweep evaluates {len(probe_rows)} latest Motion-JEPA checkpoints at initial learning rates {', '.join(f'`{lr:g}`' for lr in lrs)}. Each biased linear head is trained for {int(sweep_config['epochs'])} epochs with SGD, momentum {float(sweep_config['momentum']):g}, zero weight decay, cosine decay, batch size {int(sweep_config['batch_size'])}, and seed {seed}. Frozen EMA target-encoder outputs are mean-pooled over valid tokens.",
+        f"The sweep evaluates {len(probe_rows)} latest MotionJEPA checkpoints at initial learning rates {', '.join(f'`{lr:g}`' for lr in lrs)}. Each biased linear head is trained for {int(sweep_config['epochs'])} epochs with SGD, momentum {float(sweep_config['momentum']):g}, zero weight decay, cosine decay, batch size {int(sweep_config['batch_size'])}, and seed {seed}. Frozen EMA target-encoder outputs are mean-pooled over valid tokens.",
         "",
         f"### Model comparison at LR {FIXED_LR_COMPARISON:g}",
         "",
-        f"![Motion-JEPA model comparison at LR {FIXED_LR_COMPARISON:g}](linear-probe/lr-0p3-model-comparison.png)",
+        f"![MotionJEPA model comparison at LR {FIXED_LR_COMPARISON:g}](linear-probe/lr-0p3-model-comparison.png)",
         "",
         "![Validation top-1 heatmap](linear-probe/validation-top1-heatmap.png)",
         "",

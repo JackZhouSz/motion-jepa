@@ -1,4 +1,4 @@
-"""Paths to assets packaged with Motion-JEPA."""
+"""Paths to assets packaged with MotionJEPA."""
 
 from pathlib import Path
 

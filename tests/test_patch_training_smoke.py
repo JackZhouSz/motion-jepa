@@ -1,4 +1,4 @@
-"""End-to-end CPU smoke test for patchified Motion-JEPA."""
+"""End-to-end CPU smoke test for patchified MotionJEPA."""
 
 from __future__ import annotations
 

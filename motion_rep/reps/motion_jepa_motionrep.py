@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""The stable 366-dimensional Motion-JEPA motion representation."""
+"""The stable 366-dimensional MotionJEPA motion representation."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ class MotionJEPAMotionRep(MotionRepBase):
         if to_canonicalize:
             features = self.canonicalize(features)
         if features.shape[-1] != self.FEATURE_DIM:
-            raise RuntimeError(f"Unexpected Motion-JEPA feature shape: {features.shape}")
+            raise RuntimeError(f"Unexpected MotionJEPA feature shape: {features.shape}")
         return features[0] if unbatched else features
 
     def encode(

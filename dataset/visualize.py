@@ -1,4 +1,4 @@
-"""Visualize processed Motion-JEPA clips selected by their NPY path."""
+"""Visualize processed MotionJEPA clips selected by their NPY path."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ class ProcessedDatasetViewer:
         self.server = viser.ViserServer(
             host=host,
             port=port,
-            label="Motion-JEPA Processed Dataset",
+            label="MotionJEPA Processed Dataset",
             enable_camera_keyboard_controls=False,
         )
         self.server.scene.world_axes.visible = False
@@ -273,7 +273,7 @@ class ProcessedDatasetViewer:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Visualize processed Motion-JEPA NPY clips using a path dropdown."
+        description="Visualize processed MotionJEPA NPY clips using a path dropdown."
     )
     parser.add_argument(
         "input",

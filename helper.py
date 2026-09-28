@@ -1,4 +1,4 @@
-"""Model and optimizer construction for Motion-JEPA training."""
+"""Model and optimizer construction for MotionJEPA training."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Structured masking for Motion-JEPA."""
+"""Structured masking for MotionJEPA."""
 
 from .collators import MaskCollator1D, MaskCollator2D
 from .body_region_collator import (

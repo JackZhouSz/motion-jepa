@@ -46,7 +46,7 @@ An input is stride-sampled only when its half-up-rounded FPS is divisible by
 Successful conversions are appended to `conversion_manifest.jsonl`, while
 discard and error details are appended to `errors.jsonl`.
 
-## Motion-JEPA preprocessing and visualization
+## MotionJEPA preprocessing and visualization
 
 The AMASS preprocessor validates the conversion manifest against every BVH,
 keeps only complete 90-frame windows with 50% overlap, and places all windows

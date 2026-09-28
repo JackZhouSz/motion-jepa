@@ -1,4 +1,4 @@
-"""Regression tests for structured deterministic Motion-JEPA masks."""
+"""Regression tests for structured deterministic MotionJEPA masks."""
 
 from __future__ import annotations
 

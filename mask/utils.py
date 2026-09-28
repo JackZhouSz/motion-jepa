@@ -1,4 +1,4 @@
-"""Mask tensor helpers shared by Motion-JEPA variants."""
+"""Mask tensor helpers shared by MotionJEPA variants."""
 
 from __future__ import annotations
 

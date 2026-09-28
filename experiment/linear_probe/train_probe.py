@@ -1,4 +1,4 @@
-"""Train a linear probe on frozen Motion-JEPA features."""
+"""Train a linear probe on frozen MotionJEPA features."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .dataset import build_style_datasets, load_style_label_index
+from .dataset import MultiLabelIndex, SingleLabelIndex, build_classification_datasets
 from .features import (
     PROJECT_ROOT,
     SPLITS,
@@ -270,6 +270,112 @@ def train_linear_probe(
     }
 
 
+def _evaluate_multilabel_linear_probe(
+    classifier: nn.Linear,
+    cache: dict[str, Any],
+    *,
+    label_index: MultiLabelIndex,
+    device: torch.device,
+    batch_size: int,
+) -> dict[str, float | int]:
+    # Share BABEL's AP and hit definitions with the offline classifier runner.
+    from .train_classifier import MultiLabelMetricAccumulator
+
+    classifier.eval()
+    features = cache["features"]
+    labels = cache["labels"]
+    sample_ids = cache["sample_ids"]
+    metrics = MultiLabelMetricAccumulator(
+        label_index.num_classes, label_index.row_labels_by_path
+    )
+    with torch.inference_mode():
+        for start in range(0, len(features), batch_size):
+            end = start + batch_size
+            inputs = features[start:end].to(device=device, dtype=torch.float32)
+            targets = labels[start:end].to(device=device, dtype=torch.float32)
+            logits = classifier(inputs)
+            loss_sum = F.binary_cross_entropy_with_logits(
+                logits, targets, reduction="sum"
+            ) / label_index.num_classes
+            metrics.update(logits, targets, float(loss_sum), sample_ids[start:end])
+    return asdict(metrics.compute())
+
+
+def train_multilabel_probe(
+    caches: dict[str, dict[str, Any]],
+    *,
+    label_index: MultiLabelIndex,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    momentum: float,
+    weight_decay: float,
+    seed: int,
+) -> dict[str, Any]:
+    """Fit a fresh in-memory BABEL head and select it by validation mAP."""
+    train = caches["train"]
+    validation = caches["val"]
+    feature_dim = int(train["features"].shape[1])
+    num_classes = label_index.num_classes
+    if not len(train["labels"]) or not len(validation["labels"]):
+        raise ValueError("BABEL online probing requires nonempty train and val splits")
+    for split, cache in (("train", train), ("val", validation)):
+        if (
+            cache["features"].ndim != 2
+            or cache["features"].shape[1] != feature_dim
+            or cache["labels"].shape != (len(cache["features"]), num_classes)
+            or cache["labels"].dtype != torch.float32
+            or len(cache["sample_ids"]) != len(cache["features"])
+        ):
+            raise ValueError(f"Invalid BABEL online feature cache for {split}")
+
+    _seed_all(seed)
+    classifier = nn.Linear(feature_dim, num_classes).to(device)
+    optimizer = torch.optim.SGD(
+        classifier.parameters(), lr=learning_rate, momentum=momentum,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    loader = DataLoader(
+        TensorDataset(train["features"], train["labels"]),
+        batch_size=batch_size, shuffle=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
+    best_score = float("-inf")
+    best_epoch = None
+    best_metrics = None
+    for epoch in range(1, epochs + 1):
+        classifier.train()
+        for features, labels in loader:
+            features = features.to(device=device, dtype=torch.float32)
+            labels = labels.to(device=device, dtype=torch.float32)
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.binary_cross_entropy_with_logits(classifier(features), labels)
+            loss.backward()
+            optimizer.step()
+        metrics = _evaluate_multilabel_linear_probe(
+            classifier, validation, label_index=label_index,
+            device=device, batch_size=batch_size,
+        )
+        score = float(metrics["mean_average_precision"])
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch
+            best_metrics = metrics
+        scheduler.step()
+    return {
+        "best_epoch": best_epoch,
+        "best_val": best_metrics,
+        "selection": "validation_best",
+        "validation_used": True,
+        "test": None,
+        "feature_dim": feature_dim,
+        "num_classes": num_classes,
+        "split_counts": {"train": len(train["labels"]), "val": len(validation["labels"]), "test": 0},
+    }
+
+
 def _serializable_args(args: argparse.Namespace) -> dict[str, Any]:
     return {
         key: str(value) if isinstance(value, Path) else value
@@ -320,24 +426,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"got {model_info['model_name']}"
         )
     stats_root = resolve_pretraining_stats(config, args.stats_path)
-    label_index = load_style_label_index(dataset_root)
-    class_names = list(label_index.class_names)
-    _atomic_json_save(label_index.to_json(), output / "class-index.json")
-
-    datasets, _ = build_style_datasets(
+    datasets, label_index = build_classification_datasets(
         dataset_root,
         splits=SPLITS,
         num_frames=model_info["num_frames"],
         fps=model_info["fps"],
         motion_dim=model_info["motion_dim"],
         stats_root=stats_root,
-        label_index=label_index,
     )
+    if not isinstance(label_index, SingleLabelIndex):
+        raise ValueError("This probe command requires single-label classification data")
+    class_names = list(label_index.class_names)
+    _atomic_json_save(label_index.to_json(), output / "class-index.json")
     train_classes = set(datasets["train"].labels)
     expected_classes = set(range(len(class_names)))
     if train_classes != expected_classes:
         missing = [class_names[index] for index in sorted(expected_classes - train_classes)]
-        raise ValueError(f"Training split does not contain every style class: {missing}")
+        raise ValueError(f"Training split does not contain every class: {missing}")
 
     caches = {}
     for split in SPLITS:
@@ -409,7 +514,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Linear-probe Motion-JEPA features")
+    parser = argparse.ArgumentParser(description="Linear-probe MotionJEPA features")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
         "--dataset-root",

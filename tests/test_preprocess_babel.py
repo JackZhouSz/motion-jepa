@@ -11,7 +11,7 @@ import torch
 
 from dataset import MotionDataset, preprocess_babel
 from dataset.convert_amass_to_soma import write_bvh_atomic
-from experiment.linear_probe.dataset import load_style_label_index
+from experiment.linear_probe.dataset import load_classification_label_index
 from skeleton import SOMASkeleton77
 from visualization.dataset_viewer import discover_entries, load_motion
 
@@ -152,10 +152,12 @@ def test_preprocess_shares_multilabel_motion_and_zero_pads_tail(tmp_path: Path) 
     assert np.array_equal(padded[:30], stored)
     assert np.count_nonzero(padded[30:]) == 0
 
-    label_index = load_style_label_index(args.output)
+    label_index = load_classification_label_index(args.output)
     assert label_index.num_classes == 60
     assert label_index.class_names[:2] == ("walk", "stand")
-    assert [label_index.label_for_sample(record["id"]) for record in index] == [0, 1]
+    labels = label_index.label_for_sample(index[0]["motion_path"])
+    assert torch.equal(labels[:2], torch.tensor([1.0, 1.0]))
+    assert int(labels.sum()) == 2
     viewer_entries = discover_entries(args.output, "train", limit=0)
     decoded, decoded_fps = load_motion(viewer_entries[0], fps=30)
     assert decoded_fps == 30

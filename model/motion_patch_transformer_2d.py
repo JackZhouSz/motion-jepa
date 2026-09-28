@@ -1,4 +1,4 @@
-"""Temporal and anatomical patchification for skeletal Motion-JEPA."""
+"""Temporal and anatomical patchification for skeletal MotionJEPA."""
 
 from __future__ import annotations
 

@@ -1,8 +1,9 @@
-"""Classification datasets for 100STYLE and BABEL action labels."""
+"""Single-label and multi-label motion classification datasets."""
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -17,12 +18,12 @@ DEFAULT_SPLITS = ("train", "val", "test")
 
 
 @dataclass(frozen=True)
-class StyleLabelIndex:
-    """Stable mappings between style names, class IDs, and sample IDs."""
+class SingleLabelIndex:
+    """Stable mappings between class names, IDs, and sample IDs."""
 
     class_names: tuple[str, ...]
     class_to_index: dict[str, int]
-    style_by_id: dict[str, str]
+    label_name_by_id: dict[str, str]
 
     @property
     def num_classes(self) -> int:
@@ -30,10 +31,10 @@ class StyleLabelIndex:
 
     def label_for_sample(self, sample_id: str) -> int:
         try:
-            style = self.style_by_id[sample_id]
+            label_name = self.label_name_by_id[sample_id]
         except KeyError as error:
-            raise KeyError(f"Sample ID is missing from the style index: {sample_id}") from error
-        return self.class_to_index[style]
+            raise KeyError(f"Sample ID is missing from the classification index: {sample_id}") from error
+        return self.class_to_index[label_name]
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -43,8 +44,8 @@ class StyleLabelIndex:
 
 
 @dataclass(frozen=True)
-class BabelLabelIndex:
-    """Official class IDs and all positive labels for each unique BABEL chunk."""
+class MultiLabelIndex:
+    """Class IDs and all positive labels for each unique motion clip."""
 
     class_names: tuple[str, ...]
     class_to_index: dict[str, int]
@@ -78,10 +79,16 @@ def classification_dataset_kind(root: str | Path) -> tuple[str, str]:
         if subset not in (60, 120) or int(metadata.get("num_classes", -1)) != subset:
             raise ValueError("BABEL metadata must declare subset and matching num_classes")
         return "multilabel", f"babel-{subset}"
-    return "single_label", "100style"
+    if source.startswith("100STYLE"):
+        return "single_label", "100style"
+    dataset_name = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    return "single_label", dataset_name or "classification"
 
 
-def load_babel_label_index(root: str | Path) -> BabelLabelIndex:
+ClassificationLabelIndex = SingleLabelIndex | MultiLabelIndex
+
+
+def _load_multilabel_label_index(root: str | Path) -> MultiLabelIndex:
     root = Path(root)
     metadata = json.loads((root / "meta.json").read_text(encoding="utf-8"))
     class_index = json.loads((root / "class-index.json").read_text(encoding="utf-8"))
@@ -121,7 +128,7 @@ def load_babel_label_index(root: str | Path) -> BabelLabelIndex:
         path_by_id[sample_id] = path
         path_split[path] = split
         row_labels.setdefault(path, []).append(label)
-    return BabelLabelIndex(
+    return MultiLabelIndex(
         class_names,
         {name: index for index, name in enumerate(class_names)},
         {path: tuple(sorted(set(labels))) for path, labels in row_labels.items()},
@@ -130,17 +137,17 @@ def load_babel_label_index(root: str | Path) -> BabelLabelIndex:
     )
 
 
-def load_style_label_index(dataset_root: str | Path) -> StyleLabelIndex:
-    """Read style names or explicit numeric action labels from ``index.json``."""
+def _load_single_label_index(dataset_root: str | Path) -> SingleLabelIndex:
+    """Read named or explicit numeric single-label classes from ``index.json``."""
     root = Path(dataset_root)
     path = root / "index.json"
     if not path.is_file():
-        raise FileNotFoundError(f"100STYLE index does not exist: {path}")
+        raise FileNotFoundError(f"Classification index does not exist: {path}")
     records = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(records, list) or not records:
-        raise ValueError(f"100STYLE index is empty or malformed: {path}")
+        raise ValueError(f"Classification index is empty or malformed: {path}")
 
-    style_by_id: dict[str, str] = {}
+    label_name_by_id: dict[str, str] = {}
     explicit_labels: dict[int, str] = {}
     uses_explicit_labels: bool | None = None
     for record in records:
@@ -154,29 +161,29 @@ def load_style_label_index(dataset_root: str | Path) -> StyleLabelIndex:
         if uses_explicit_labels is None:
             uses_explicit_labels = has_explicit_label
         elif uses_explicit_labels != has_explicit_label:
-            raise ValueError("index.json mixes style labels and explicit action labels")
+            raise ValueError("index.json mixes named and explicit action labels")
         if has_explicit_label:
             label = metadata.get("label")
-            style = metadata.get("label_name")
+            label_name = metadata.get("label_name")
             if isinstance(label, bool) or not isinstance(label, int) or label < 0:
                 raise ValueError(f"Index record has no valid numeric label: {record}")
-            if not isinstance(style, str) or not style:
+            if not isinstance(label_name, str) or not label_name:
                 raise ValueError(f"Index record has no valid label_name: {record}")
-            previous = explicit_labels.setdefault(label, style)
-            if previous != style:
+            previous = explicit_labels.setdefault(label, label_name)
+            if previous != label_name:
                 raise ValueError(
-                    f"Conflicting names for explicit label {label}: {previous!r}, {style!r}"
+                    f"Conflicting names for explicit label {label}: {previous!r}, {label_name!r}"
                 )
         else:
             label = None
-            style = metadata.get("style")
+            label_name = metadata.get("style")
         if not isinstance(sample_id, str) or not sample_id:
             raise ValueError(f"Index record has no valid sample ID: {record}")
-        if not isinstance(style, str) or not style:
-            raise ValueError(f"Index record has no valid style label: {record}")
-        if sample_id in style_by_id:
+        if not isinstance(label_name, str) or not label_name:
+            raise ValueError(f"Index record has no valid class label: {record}")
+        if sample_id in label_name_by_id:
             raise ValueError(f"Duplicate sample ID in index: {sample_id}")
-        style_by_id[sample_id] = style
+        label_name_by_id[sample_id] = label_name
 
     if uses_explicit_labels:
         metadata_path = root / "meta.json"
@@ -206,19 +213,21 @@ def load_style_label_index(dataset_root: str | Path) -> StyleLabelIndex:
         if len(class_to_index) != len(class_names):
             raise ValueError("Explicit action label names must be unique")
     else:
-        class_names = tuple(sorted(set(style_by_id.values())))
+        class_names = tuple(sorted(set(label_name_by_id.values())))
         class_to_index = {name: index for index, name in enumerate(class_names)}
-    return StyleLabelIndex(class_names, class_to_index, style_by_id)
+    return SingleLabelIndex(class_names, class_to_index, label_name_by_id)
 
 
-def load_style_index(dataset_root: str | Path) -> tuple[list[str], dict[str, str]]:
-    """Compatibility tuple for callers predating StyleLabelIndex."""
-    index = load_style_label_index(dataset_root)
-    return list(index.class_names), dict(index.style_by_id)
+def load_classification_label_index(root: str | Path) -> ClassificationLabelIndex:
+    """Load the label index indicated by the dataset metadata."""
+    root = Path(root)
+    if (root / "meta.json").is_file() and classification_dataset_kind(root)[0] == "multilabel":
+        return _load_multilabel_label_index(root)
+    return _load_single_label_index(root)
 
 
-class StyleMotionDataset(Dataset):
-    """Attach deterministic style labels and sample IDs to MotionDataset."""
+class SingleLabelMotionDataset(Dataset):
+    """Attach single class IDs and sample IDs to MotionDataset."""
 
     def __init__(
         self,
@@ -229,7 +238,7 @@ class StyleMotionDataset(Dataset):
         fps: int,
         motion_dim: int,
         stats_root: str | Path,
-        label_index: StyleLabelIndex,
+        label_index: SingleLabelIndex,
     ) -> None:
         self.motion = MotionDataset(
             root_path=root,
@@ -245,7 +254,7 @@ class StyleMotionDataset(Dataset):
         missing = [
             sample_id
             for sample_id in self.sample_ids
-            if sample_id not in label_index.style_by_id
+            if sample_id not in label_index.label_name_by_id
         ]
         if missing:
             raise ValueError(
@@ -261,8 +270,8 @@ class StyleMotionDataset(Dataset):
         return motion, fps, length, self.labels[index], self.sample_ids[index]
 
 
-class BabelMotionDataset(Dataset):
-    """Load each BABEL NPY once and attach its complete multi-hot target."""
+class MultiLabelMotionDataset(Dataset):
+    """Load each motion file once and attach its complete multi-hot target."""
 
     def __init__(
         self,
@@ -273,7 +282,7 @@ class BabelMotionDataset(Dataset):
         fps: int,
         motion_dim: int,
         stats_root: str | Path,
-        label_index: BabelLabelIndex,
+        label_index: MultiLabelIndex,
     ) -> None:
         self.motion = MotionDataset(
             root_path=root,
@@ -292,7 +301,7 @@ class BabelMotionDataset(Dataset):
         for index, entry in enumerate(self.motion.entries):
             path = label_index.path_by_id.get(entry.sample_id)
             if path is None or Path(root) / path != entry.path:
-                raise ValueError(f"BABEL split {split} has an unmatched index row: {entry.sample_id}")
+                raise ValueError(f"Multi-label split {split} has an unmatched index row: {entry.sample_id}")
             if path in seen:
                 continue
             seen.add(path)
@@ -321,14 +330,14 @@ class EmptyClassificationDataset(Dataset):
         raise IndexError(index)
 
 
-class StyleTokenDataset(Dataset):
+class ClassificationTokenDataset(Dataset):
     """Expose a validated cached JEPA token split through the motion batch API."""
 
     def __init__(
         self,
         payload: dict[str, object],
         *,
-        label_index: StyleLabelIndex | BabelLabelIndex,
+        label_index: ClassificationLabelIndex,
         fps: int,
     ) -> None:
         features = payload.get("features")
@@ -341,8 +350,8 @@ class StyleTokenDataset(Dataset):
             raise ValueError("Token cache features must use bfloat16")
         if not isinstance(lengths, torch.Tensor) or lengths.dtype != torch.long:
             raise ValueError("Token cache lengths must be int64")
-        is_babel = isinstance(label_index, BabelLabelIndex)
-        expected_dtype = torch.float32 if is_babel else torch.long
+        is_multilabel = isinstance(label_index, MultiLabelIndex)
+        expected_dtype = torch.float32 if is_multilabel else torch.long
         if not isinstance(labels, torch.Tensor) or labels.dtype != expected_dtype:
             raise ValueError(f"Token cache labels must use {expected_dtype}")
         if not isinstance(sample_ids, list) or not all(
@@ -354,7 +363,7 @@ class StyleTokenDataset(Dataset):
             raise ValueError("Token cache fields have inconsistent sample counts")
         if (lengths < 0).any() or (lengths > features.shape[1]).any():
             raise ValueError("Token cache contains invalid sequence lengths")
-        if is_babel:
+        if is_multilabel:
             expected_labels = (
                 torch.stack([label_index.label_for_sample(sample_id) for sample_id in sample_ids])
                 if sample_ids else torch.empty((0, label_index.num_classes), dtype=torch.float32)
@@ -365,7 +374,7 @@ class StyleTokenDataset(Dataset):
                 dtype=torch.long,
             )
         if not torch.equal(labels, expected_labels):
-            raise ValueError("Token cache labels do not match the style index")
+            raise ValueError("Token cache labels do not match the classification index")
         if not torch.isfinite(features).all():
             raise ValueError("Token cache contains non-finite features")
         self.features = features
@@ -387,34 +396,6 @@ class StyleTokenDataset(Dataset):
         )
 
 
-def build_style_datasets(
-    root: str | Path,
-    *,
-    splits: Iterable[str] = DEFAULT_SPLITS,
-    num_frames: int,
-    fps: int,
-    motion_dim: int,
-    stats_root: str | Path,
-    label_index: StyleLabelIndex | None = None,
-) -> tuple[dict[str, StyleMotionDataset], StyleLabelIndex]:
-    """Build split datasets that all share one stable style-label index."""
-    root = Path(root)
-    resolved_index = label_index or load_style_label_index(root)
-    datasets = {
-        split: StyleMotionDataset(
-            root,
-            split,
-            num_frames=num_frames,
-            fps=fps,
-            motion_dim=motion_dim,
-            stats_root=stats_root,
-            label_index=resolved_index,
-        )
-        for split in splits
-    }
-    return datasets, resolved_index
-
-
 def build_classification_datasets(
     root: str | Path,
     *,
@@ -423,8 +404,8 @@ def build_classification_datasets(
     fps: int,
     motion_dim: int,
     stats_root: str | Path,
-    label_index: StyleLabelIndex | BabelLabelIndex | None = None,
-) -> tuple[dict[str, Dataset], StyleLabelIndex | BabelLabelIndex]:
+    label_index: ClassificationLabelIndex | None = None,
+) -> tuple[dict[str, Dataset], ClassificationLabelIndex]:
     task, _ = classification_dataset_kind(root)
     root = Path(root)
     requested = tuple(splits)
@@ -435,24 +416,19 @@ def build_classification_datasets(
         if split == "test" and not txt_exists and not manifest_exists:
             continue
         available.append(split)
+    resolved = label_index or load_classification_label_index(root)
     if task == "single_label":
-        if label_index is not None and not isinstance(label_index, StyleLabelIndex):
-            raise TypeError("100STYLE requires a StyleLabelIndex")
-        datasets, resolved = build_style_datasets(
-            root, splits=available, num_frames=num_frames, fps=fps,
-            motion_dim=motion_dim, stats_root=stats_root, label_index=label_index,
-        )
-        return {
-            split: datasets[split] if split in datasets else EmptyClassificationDataset()
-            for split in requested
-        }, resolved
-    if label_index is not None and not isinstance(label_index, BabelLabelIndex):
-        raise TypeError("BABEL requires a BabelLabelIndex")
-    resolved = label_index or load_babel_label_index(root)
+        if not isinstance(resolved, SingleLabelIndex):
+            raise TypeError("Single-label classification requires a SingleLabelIndex")
+        dataset_type = SingleLabelMotionDataset
+    else:
+        if not isinstance(resolved, MultiLabelIndex):
+            raise TypeError("Multi-label classification requires a MultiLabelIndex")
+        dataset_type = MultiLabelMotionDataset
     datasets = {
-        split: BabelMotionDataset(
-            root, split, num_frames=num_frames, fps=fps,
-            motion_dim=motion_dim, stats_root=stats_root, label_index=resolved,
+        split: dataset_type(
+            root, split, num_frames=num_frames, fps=fps, motion_dim=motion_dim,
+            stats_root=stats_root, label_index=resolved,
         )
         for split in available
     }
@@ -463,17 +439,15 @@ def build_classification_datasets(
 
 
 __all__ = [
-    "BabelLabelIndex",
-    "BabelMotionDataset",
+    "ClassificationLabelIndex",
+    "ClassificationTokenDataset",
     "DEFAULT_SPLITS",
     "EmptyClassificationDataset",
-    "StyleLabelIndex",
-    "StyleMotionDataset",
-    "StyleTokenDataset",
+    "MultiLabelIndex",
+    "MultiLabelMotionDataset",
+    "SingleLabelIndex",
+    "SingleLabelMotionDataset",
     "build_classification_datasets",
-    "build_style_datasets",
     "classification_dataset_kind",
-    "load_babel_label_index",
-    "load_style_index",
-    "load_style_label_index",
+    "load_classification_label_index",
 ]

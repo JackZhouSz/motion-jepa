@@ -1,4 +1,4 @@
-"""Launch the independent Motion-JEPA dataset viewer."""
+"""Launch the independent MotionJEPA dataset viewer."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Visualize a Motion-JEPA NPY dataset with viser.")
+    parser = argparse.ArgumentParser(description="Visualize a MotionJEPA NPY dataset with viser.")
     parser.add_argument(
         "input",
         nargs="?",

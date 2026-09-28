@@ -1,4 +1,4 @@
-"""Named Motion-JEPA encoder size specifications."""
+"""Named MotionJEPA encoder size specifications."""
 
 MODEL_SPECS = {
     "tiny":   {"embed_dim": 192,  "depth": 6,  "num_heads": 3},

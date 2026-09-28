@@ -1,4 +1,4 @@
-"""Forward-kinematics utilities for Motion-JEPA skeletons."""
+"""Forward-kinematics utilities for MotionJEPA skeletons."""
 
 import torch
 

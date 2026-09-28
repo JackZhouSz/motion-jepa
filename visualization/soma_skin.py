@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""SOMA linear-blend skinning used by the Motion-JEPA viewer."""
+"""SOMA linear-blend skinning used by the MotionJEPA viewer."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Frame-token Motion-JEPA encoder and predictor."""
+"""Frame-token MotionJEPA encoder and predictor."""
 
 from __future__ import annotations
 

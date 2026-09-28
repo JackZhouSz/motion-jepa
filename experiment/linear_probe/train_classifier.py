@@ -26,8 +26,8 @@ from tqdm import tqdm  # noqa: E402
 
 from .cnn import MotionCNNClassifier
 from .dataset import (
-    BabelLabelIndex,
-    StyleTokenDataset,
+    ClassificationTokenDataset,
+    MultiLabelIndex,
     build_classification_datasets,
     classification_dataset_kind,
 )
@@ -76,7 +76,7 @@ class PreparedInput:
     input_source: str
     jepa_source: dict[str, Any] | None
     task: str = "single_label"
-    dataset_name: str = "100style"
+    dataset_name: str = "classification"
 
 
 class MetricAccumulator:
@@ -485,7 +485,7 @@ def _validate_token_cache(
         raise ValueError(
             "JEPA token cache metadata is stale; rerun with --recompute-features"
         )
-    dataset = StyleTokenDataset(
+    dataset = ClassificationTokenDataset(
         payload,
         label_index=label_index,
         fps=int(expected_metadata["fps"]),
@@ -656,7 +656,7 @@ def _prepare_input(
         if cache_value is not None else default_cache_root
     )
     cache_root.mkdir(parents=True, exist_ok=True)
-    token_datasets: dict[str, StyleTokenDataset] = {}
+    token_datasets: dict[str, ClassificationTokenDataset] = {}
     feature_batch_size = int(_argument(args, "feature_batch_size", 256))
     class_names = list(label_index.class_names)
     for split in ("train", "val", "test"):
@@ -695,7 +695,7 @@ def _prepare_input(
                 num_workers=args.num_workers,
                 recompute=bool(_argument(args, "recompute_features", False)),
             )
-        token_datasets[split] = StyleTokenDataset(
+        token_datasets[split] = ClassificationTokenDataset(
             payload, label_index=label_index, fps=model_info["fps"]
         )
     jepa_source = {
@@ -824,7 +824,7 @@ def run_model(
     label_index = prepared.label_index
     row_labels_by_sample = (
         label_index.row_labels_by_path
-        if isinstance(label_index, BabelLabelIndex) else None
+        if isinstance(label_index, MultiLabelIndex) else None
     )
     validation_used = len(datasets["val"]) > 0
     selection = "validation_best" if validation_used else "fixed_last_epoch"
@@ -1172,7 +1172,7 @@ def write_findings(
     input_source: str,
     jepa_source: dict[str, Any] | None,
     task: str = "single_label",
-    dataset_name: str = "100style",
+    dataset_name: str = "classification",
 ) -> None:
     validation_used = all(
         bool(summary.get("validation_used", True)) for summary in summaries.values()
@@ -1289,23 +1289,25 @@ def write_findings(
         (findings_root / "README.md").write_text("\n".join(lines), encoding="utf-8")
         return
 
+    architecture = summaries["transformer"]["signature"]["architecture"]
+    input_shape = f"[{architecture['num_frames']},{architecture['input_dim']}]"
     source_description = (
-        "100STYLE raw motion `[90,366]`"
+        f"{dataset_name.upper()} raw motion `{input_shape}`"
         if input_source == "raw"
         else (
             f"frozen `{jepa_source['model_name']}` frame-token features "
-            f"`[90,{jepa_source['feature_dim']}]`"
+            f"`{input_shape}`"
         )
     )
     lines = [
-        "# 100STYLE Raw-Motion Classifiers",
+        f"# {dataset_name.upper()} Classifiers",
         "",
         f"Both models were trained from {source_description} with seed {seed}.",
         "",
         "## Shared settings",
         "",
         (
-            "- 100STYLE train statistics normalization"
+            "- Dataset train statistics normalization"
             if input_source == "raw"
             else "- Frozen JEPA target-encoder tokens using pretraining statistics"
         ),
@@ -1413,7 +1415,7 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     )
     default_findings = (
         output_root / "findings"
-        if task == "multilabel" or input_source == "jepa"
+        if task == "multilabel" or input_source == "jepa" or dataset_name != "100style"
         else DEFAULT_RAW_FINDINGS_ROOT
     )
     findings_root = (
@@ -1449,7 +1451,7 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train 100STYLE or BABEL classifiers from raw motion or frozen JEPA tokens"
+        description="Train motion classifiers from raw motion or frozen JEPA tokens"
     )
     parser.add_argument("--model", choices=(*AVAILABLE_MODELS, "all"), default="all")
     parser.add_argument("--input-source", choices=("raw", "jepa"), default="raw")

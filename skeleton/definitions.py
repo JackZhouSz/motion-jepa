@@ -1,4 +1,4 @@
-"""SOMA skeleton definitions used by Motion-JEPA."""
+"""SOMA skeleton definitions used by MotionJEPA."""
 
 import torch
 
