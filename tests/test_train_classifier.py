@@ -61,8 +61,8 @@ class ClassifierModelTest(unittest.TestCase):
             logits.square().mean().backward()
             self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
             counts.append(sum(parameter.numel() for parameter in model.parameters()))
-        self.assertTrue(all(6_000_000 <= count <= 7_000_000 for count in counts))
-        self.assertLess(max(counts) / min(counts), 1.05)
+        self.assertTrue(all(800_000 <= count <= 1_200_000 for count in counts))
+        self.assertLess(max(counts) / min(counts), 1.25)
 
     def test_invalid_frame_values_do_not_affect_logits(self):
         active = torch.tensor([[True] * 70 + [False] * 20])
@@ -84,6 +84,13 @@ class ClassifierModelTest(unittest.TestCase):
             logits = model(torch.randn(3, 4, 6), torch.ones(3, 4, dtype=torch.bool))
             self.assertEqual(logits.shape, (3, 2))
             self.assertEqual(config["num_classes"], 2)
+            if name == "cnn":
+                self.assertEqual(config["widths"], [128, 192, 256])
+                self.assertEqual(config["blocks_per_stage"], 1)
+            elif name == "transformer":
+                self.assertEqual(config["embed_dim"], 128)
+                self.assertEqual(config["depth"], 4)
+                self.assertEqual(config["num_heads"], 4)
 
     def test_multiple_jepa_feature_dimensions_and_legacy_alias(self):
         for input_dim in (192, 768):
@@ -102,8 +109,8 @@ class ClassifierModelTest(unittest.TestCase):
 
     def test_transformer_uses_a_learnable_cls_token(self):
         model = MotionTransformerClassifier(num_frames=4, motion_dim=6, num_classes=2)
-        self.assertEqual(model.cls_token.shape, (1, 1, 256))
-        self.assertEqual(model.position_embedding.shape, (1, 5, 256))
+        self.assertEqual(model.cls_token.shape, (1, 1, 128))
+        self.assertEqual(model.position_embedding.shape, (1, 5, 128))
         with self.assertRaises(TypeError):
             MotionTransformerClassifier(
                 num_frames=4,

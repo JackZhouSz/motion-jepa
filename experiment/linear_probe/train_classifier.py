@@ -11,7 +11,7 @@ import shutil
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import matplotlib
 
@@ -59,7 +59,7 @@ METRIC_FIELDS = (
     "top5_accuracy",
 )
 MULTILABEL_METRIC_FIELDS = (
-    "loss", "mean_average_precision", "top1_hit", "top5_hit",
+    "loss", "mean_average_precision", "top1_hit", "top1_label_row_accuracy", "top5_hit",
     "classes_with_positives", "classes_without_positives",
 )
 TOKEN_CACHE_FORMAT_VERSION = 1
@@ -132,24 +132,40 @@ class MultiLabelMetrics:
     loss: float
     mean_average_precision: float
     top1_hit: float
+    top1_label_row_accuracy: float
     top5_hit: float
     classes_with_positives: int
     classes_without_positives: int
 
 
 class MultiLabelMetricAccumulator:
-    def __init__(self, num_classes: int) -> None:
+    def __init__(
+        self,
+        num_classes: int,
+        row_labels_by_sample: Mapping[str, Sequence[int]],
+    ) -> None:
         self.num_classes = num_classes
+        self.row_labels_by_sample = row_labels_by_sample
         self.loss_sum = 0.0
         self.scores: list[torch.Tensor] = []
         self.targets: list[torch.Tensor] = []
+        self.sample_ids: list[str] = []
 
-    def update(self, logits: torch.Tensor, labels: torch.Tensor, loss_sum: float) -> None:
+    def update(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        loss_sum: float,
+        sample_ids: Sequence[str],
+    ) -> None:
         if labels.shape != logits.shape or labels.ndim != 2:
             raise ValueError("Multi-label targets must match logits [batch, classes]")
+        if len(sample_ids) != len(labels):
+            raise ValueError("Sample IDs must match the multi-label batch size")
         self.loss_sum += float(loss_sum)
         self.scores.append(logits.detach().float().cpu())
         self.targets.append(labels.detach().float().cpu())
+        self.sample_ids.extend(sample_ids)
 
     def compute(self) -> MultiLabelMetrics:
         if not self.scores:
@@ -158,8 +174,17 @@ class MultiLabelMetricAccumulator:
         targets = torch.cat(self.targets)
         if not torch.all((targets == 0) | (targets == 1)) or not torch.all(targets.sum(1) > 0):
             raise ValueError("Multi-label targets must be nonempty binary vectors")
-        top1 = targets.gather(1, scores.argmax(dim=1, keepdim=True)).sum().item()
+        predictions = scores.argmax(dim=1)
+        top1 = targets.gather(1, predictions[:, None]).sum().item()
         top5 = targets.gather(1, scores.topk(min(5, self.num_classes), dim=1).indices)
+        label_row_hits = 0
+        label_row_count = 0
+        for index, sample_id in enumerate(self.sample_ids):
+            row_labels = self.row_labels_by_sample[sample_id]
+            if not row_labels or any(targets[index, label] != 1 for label in row_labels):
+                raise ValueError(f"Label rows do not match multi-hot target: {sample_id}")
+            label_row_hits += sum(label == predictions[index].item() for label in row_labels)
+            label_row_count += len(row_labels)
         average_precisions = []
         for class_id in range(self.num_classes):
             positives = targets[:, class_id]
@@ -174,6 +199,7 @@ class MultiLabelMetricAccumulator:
             loss=self.loss_sum / len(scores),
             mean_average_precision=sum(average_precisions) / len(average_precisions),
             top1_hit=float(top1 / len(scores)),
+            top1_label_row_accuracy=label_row_hits / label_row_count,
             top5_hit=float(top5.any(dim=1).float().mean()),
             classes_with_positives=len(average_precisions),
             classes_without_positives=self.num_classes - len(average_precisions),
@@ -198,8 +224,8 @@ def make_classifier(
             "name": "MotionCNNClassifier",
             "input_dim": resolved_input_dim,
             "num_classes": num_classes,
-            "widths": [256, 384, 512],
-            "blocks_per_stage": 2,
+            "widths": [128, 192, 256],
+            "blocks_per_stage": 1,
             "dropout": 0.1,
         }
         model = MotionCNNClassifier(
@@ -215,9 +241,9 @@ def make_classifier(
             "input_dim": resolved_input_dim,
             "num_frames": num_frames,
             "num_classes": num_classes,
-            "embed_dim": 256,
-            "depth": 8,
-            "num_heads": 8,
+            "embed_dim": 128,
+            "depth": 4,
+            "num_heads": 4,
             "mlp_ratio": 4.0,
             "dropout": 0.1,
             "drop_path_rate": 0.1,
@@ -288,6 +314,16 @@ def _valid_frames(motion: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _positive_class_weights(targets: torch.Tensor, cap: float) -> torch.Tensor:
+    """Weight train positives by capped square-root inverse frequency."""
+    if targets.ndim != 2 or not torch.all((targets == 0) | (targets == 1)):
+        raise ValueError("Positive weights require a binary [samples, classes] target matrix")
+    positives = targets.float().sum(dim=0)
+    negatives = len(targets) - positives
+    weights = torch.sqrt(negatives / positives.clamp_min(1)).clamp(min=1, max=cap)
+    return torch.where(positives > 0, weights, torch.ones_like(weights))
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -298,10 +334,17 @@ def train_epoch(
     use_bfloat16: bool,
     gradient_clip: float,
     task: str = "single_label",
+    pos_weight: torch.Tensor | None = None,
+    row_labels_by_sample: Mapping[str, Sequence[int]] | None = None,
 ) -> Metrics | MultiLabelMetrics:
     model.train()
-    metrics = MultiLabelMetricAccumulator(num_classes) if task == "multilabel" else MetricAccumulator(num_classes)
-    for motion, _, length, labels, _ in loader:
+    if task == "multilabel" and row_labels_by_sample is None:
+        raise ValueError("BABEL label rows are required for multi-label metrics")
+    metrics = (
+        MultiLabelMetricAccumulator(num_classes, row_labels_by_sample)
+        if task == "multilabel" else MetricAccumulator(num_classes)
+    )
+    for motion, _, length, labels, sample_ids in loader:
         motion = motion.to(device=device, dtype=torch.float32, non_blocking=True)
         length = length.to(device=device, non_blocking=True)
         labels = labels.to(
@@ -313,13 +356,16 @@ def train_epoch(
         with _amp_context(device, use_bfloat16):
             logits = model(motion, active)
             loss = (
-                F.binary_cross_entropy_with_logits(logits, labels)
+                F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
                 if task == "multilabel" else F.cross_entropy(logits, labels)
             )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
         optimizer.step()
-        metrics.update(logits, labels, float(loss.detach()) * len(labels))
+        if task == "multilabel":
+            metrics.update(logits, labels, float(loss.detach()) * len(labels), sample_ids)
+        else:
+            metrics.update(logits, labels, float(loss.detach()) * len(labels))
     return metrics.compute()
 
 
@@ -331,11 +377,18 @@ def evaluate(
     num_classes: int,
     use_bfloat16: bool,
     task: str = "single_label",
+    pos_weight: torch.Tensor | None = None,
+    row_labels_by_sample: Mapping[str, Sequence[int]] | None = None,
 ) -> Metrics | MultiLabelMetrics:
     model.eval()
-    metrics = MultiLabelMetricAccumulator(num_classes) if task == "multilabel" else MetricAccumulator(num_classes)
+    if task == "multilabel" and row_labels_by_sample is None:
+        raise ValueError("BABEL label rows are required for multi-label metrics")
+    metrics = (
+        MultiLabelMetricAccumulator(num_classes, row_labels_by_sample)
+        if task == "multilabel" else MetricAccumulator(num_classes)
+    )
     with torch.inference_mode():
-        for motion, _, length, labels, _ in loader:
+        for motion, _, length, labels, sample_ids in loader:
             motion = motion.to(device=device, dtype=torch.float32, non_blocking=True)
             length = length.to(device=device, non_blocking=True)
             labels = labels.to(
@@ -345,11 +398,16 @@ def evaluate(
             with _amp_context(device, use_bfloat16):
                 logits = model(motion, _valid_frames(motion, length))
                 loss_sum = (
-                    F.binary_cross_entropy_with_logits(logits, labels, reduction="sum")
+                    F.binary_cross_entropy_with_logits(
+                        logits, labels, pos_weight=pos_weight, reduction="sum"
+                    )
                     / num_classes
                     if task == "multilabel" else F.cross_entropy(logits, labels, reduction="sum")
                 )
-            metrics.update(logits, labels, float(loss_sum))
+            if task == "multilabel":
+                metrics.update(logits, labels, float(loss_sum), sample_ids)
+            else:
+                metrics.update(logits, labels, float(loss_sum))
     return metrics.compute()
 
 
@@ -708,6 +766,7 @@ def _signature(
     dataset_root: Path,
     model_config: dict[str, Any],
     prepared: PreparedInput,
+    pos_weight: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     signature = {
         "model": model_name,
@@ -729,6 +788,12 @@ def _signature(
     if prepared.task == "multilabel":
         signature["task"] = prepared.task
         signature["selection_metric"] = "val_mean_average_precision"
+        if pos_weight is not None:
+            signature["pos_weight"] = {
+                "mode": "sqrt_inverse_frequency",
+                "cap": float(_argument(args, "pos_weight_cap", 10.0)),
+                "values": pos_weight.tolist(),
+            }
     if prepared.jepa_source is not None:
         signature["jepa_source"] = prepared.jepa_source
     return signature
@@ -757,6 +822,10 @@ def run_model(
     device = resolve_device(args.device) if device is None else device
     datasets = prepared.datasets
     label_index = prepared.label_index
+    row_labels_by_sample = (
+        label_index.row_labels_by_path
+        if isinstance(label_index, BabelLabelIndex) else None
+    )
     validation_used = len(datasets["val"]) > 0
     selection = "validation_best" if validation_used else "fixed_last_epoch"
     if prepared.task == "multilabel":
@@ -765,8 +834,16 @@ def run_model(
         train_labels = set(
             target_matrix.any(dim=0).nonzero(as_tuple=True)[0].tolist()
         )
+        pos_weight_cpu = (
+            _positive_class_weights(
+                target_matrix, float(_argument(args, "pos_weight_cap", 10.0))
+            )
+            if _argument(args, "pos_weight", "none") == "sqrt_inverse_frequency"
+            else None
+        )
     else:
         train_labels = {int(label) for label in datasets["train"].labels}
+        pos_weight_cpu = None
     missing_train = set(range(label_index.num_classes)) - train_labels
     if missing_train and prepared.task != "multilabel":
         raise ValueError(f"Training split is missing class IDs: {sorted(missing_train)}")
@@ -779,12 +856,43 @@ def run_model(
     )
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
     signature = _signature(
-        args, model_name, dataset_root, model_config, prepared
+        args, model_name, dataset_root, model_config, prepared, pos_weight_cpu
     )
     summary_path = output / "summary.json"
     if summary_path.is_file() and not args.overwrite:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if summary.get("status") == "complete" and summary.get("signature") == signature:
+            if (
+                prepared.task == "multilabel"
+                and summary.get("best_val") is not None
+                and "top1_label_row_accuracy" not in summary["best_val"]
+            ):
+                best_path = output / summary["head_filename"]
+                best = _torch_load_checkpoint(best_path)
+                if best.get("format_version") != CLASSIFIER_CHECKPOINT_FORMAT_VERSION:
+                    raise ValueError("Unsupported best classifier checkpoint format")
+                model.load_state_dict(best["model"], strict=True)
+                model = model.to(device)
+                pos_weight = pos_weight_cpu.to(device) if pos_weight_cpu is not None else None
+                generator = torch.Generator().manual_seed(args.seed)
+                loaders = _make_loaders(
+                    datasets, batch_size=args.batch_size, num_workers=args.num_workers,
+                    device=device, generator=generator,
+                )
+                summary["best_val"] = asdict(evaluate(
+                    model, loaders["val"], device=device,
+                    num_classes=label_index.num_classes,
+                    use_bfloat16=args.use_bfloat16, task=prepared.task,
+                    pos_weight=pos_weight, row_labels_by_sample=row_labels_by_sample,
+                ))
+                if len(datasets["test"]):
+                    summary["test"] = asdict(evaluate(
+                        model, loaders["test"], device=device,
+                        num_classes=label_index.num_classes,
+                        use_bfloat16=args.use_bfloat16, task=prepared.task,
+                        pos_weight=pos_weight, row_labels_by_sample=row_labels_by_sample,
+                    ))
+                _atomic_json_save(summary, summary_path)
             return summary
         raise FileExistsError(f"Classifier result already exists with another config: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -809,6 +917,7 @@ def run_model(
                 path.unlink()
 
     model = model.to(device)
+    pos_weight = pos_weight_cpu.to(device) if pos_weight_cpu is not None else None
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -859,8 +968,23 @@ def run_model(
         if not metrics_path.is_file():
             raise FileNotFoundError(f"Resume metrics do not exist: {metrics_path}")
         with metrics_path.open(encoding="utf-8", newline="") as file:
-            if len(list(csv.DictReader(file))) != start_epoch:
-                raise ValueError("Metrics row count does not match checkpoint next_epoch")
+            reader = csv.DictReader(file)
+            previous_fields = reader.fieldnames
+            previous_rows = list(reader)
+        if len(previous_rows) != start_epoch:
+            raise ValueError("Metrics row count does not match checkpoint next_epoch")
+        if previous_fields != fields:
+            legacy_fields = [
+                field for field in fields if not field.endswith("top1_label_row_accuracy")
+            ]
+            if previous_fields != legacy_fields:
+                raise ValueError("Resume metrics columns do not match this run")
+            temporary_path = metrics_path.with_suffix(".csv.tmp")
+            with temporary_path.open("w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(previous_rows)
+            temporary_path.replace(metrics_path)
     with metrics_path.open(mode, encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         if not start_epoch:
@@ -876,6 +1000,8 @@ def run_model(
                 use_bfloat16=args.use_bfloat16,
                 gradient_clip=args.gradient_clip,
                 task=prepared.task,
+                pos_weight=pos_weight,
+                row_labels_by_sample=row_labels_by_sample,
             )
             val_metrics = None
             if validation_used:
@@ -886,6 +1012,8 @@ def run_model(
                     num_classes=label_index.num_classes,
                     use_bfloat16=args.use_bfloat16,
                     task=prepared.task,
+                    pos_weight=pos_weight,
+                    row_labels_by_sample=row_labels_by_sample,
                 )
             row = {
                 "epoch": epoch + 1,
@@ -970,12 +1098,16 @@ def run_model(
             num_classes=label_index.num_classes,
             use_bfloat16=args.use_bfloat16,
             task=prepared.task,
+            pos_weight=pos_weight,
+            row_labels_by_sample=row_labels_by_sample,
         )
     test_metrics = (
         evaluate(
             model, loaders["test"], device=device,
             num_classes=label_index.num_classes,
             use_bfloat16=args.use_bfloat16, task=prepared.task,
+            pos_weight=pos_weight,
+            row_labels_by_sample=row_labels_by_sample,
         )
         if len(datasets["test"]) else None
     )
@@ -996,6 +1128,8 @@ def run_model(
         summary["task"] = prepared.task
         summary["missing_train_class_ids"] = sorted(missing_train)
         summary["selection_metric"] = "val_mean_average_precision"
+        if pos_weight_cpu is not None:
+            summary["pos_weight"] = signature["pos_weight"]
     _atomic_json_save(summary, summary_path)
     latest_path.unlink(missing_ok=True)
     (output / "model-config.json").unlink(missing_ok=True)
@@ -1007,6 +1141,26 @@ def _copy_metrics(output_root: Path, findings_root: Path, model_name: str, seed:
     destination = findings_root / f"{model_name}-metrics.csv"
     shutil.copyfile(source, destination)
     return destination
+
+
+def _architecture_descriptions(summaries: dict[str, dict[str, Any]]) -> list[str]:
+    cnn = summaries["cnn"]["signature"]["architecture"]
+    transformer = summaries["transformer"]["signature"]["architecture"]
+    cnn_blocks = cnn["blocks_per_stage"]
+    return [
+        (
+            f"- CNN: temporal ResNet, widths {'/'.join(map(str, cnn['widths']))}, "
+            f"{cnn_blocks} block{'s' if cnn_blocks != 1 else ''} per stage, "
+            f"dropout {cnn['dropout']}, "
+            "masked mean pooling."
+        ),
+        (
+            f"- Transformer: dim {transformer['embed_dim']}, "
+            f"{transformer['depth']} blocks, {transformer['num_heads']} heads, "
+            f"MLP ratio {transformer['mlp_ratio']}, dropout {transformer['dropout']}, "
+            "learnable CLS-token pooling."
+        ),
+    ]
 
 
 def write_findings(
@@ -1067,41 +1221,66 @@ def write_findings(
     plt.close(figure)
 
     if task == "multilabel":
+        weight_config = summaries["cnn"].get("pos_weight")
+        weighting_text = (
+            "BCEWithLogitsLoss is used without class weights or balanced sampling."
+            if weight_config is None else (
+                "BCEWithLogitsLoss uses train-only positive weights "
+                "sqrt(negative/positive), clipped to [1, "
+                f"{weight_config['cap']:g}]; weight range "
+                f"{min(weight_config['values']):.2f}–"
+                f"{max(weight_config['values']):.2f}. "
+                "Train and validation loss both use these weights."
+            )
+        )
         lines = [
             f"# {dataset_name.upper()} multi-label classifiers",
             "",
             f"Input: {'raw motion' if input_source == 'raw' else 'frozen JEPA tokens'}; seed {seed}.",
             "One motion chunk has one binary target vector containing all its action labels.",
-            "BCEWithLogitsLoss is used without class weights or balanced sampling.",
+            weighting_text,
             "The best checkpoint is selected by validation mean AP.",
             "Classes with no positives in a split are excluded from that split's mean AP.",
             "Top-1/top-5 hit means at least one predicted class is in the target set.",
+            "Top-1 label-row accuracy counts each original BABEL index row separately, "
+            "matching the public 2s-AGCN validation metric's unit of evaluation.",
             "Validation is used for model selection and reporting; the public test split is empty.",
             "",
             "![Training curves](training-curves.png)",
             "",
-            "| Model | Parameters | Best epoch | Val mean AP | Val top-1 hit | Val top-5 hit | Missing train classes |",
-            "|---|---:|---:|---:|---:|---:|---|",
+            "| Model | Parameters | Best epoch | Val mean AP | Val top-1 hit | Val top-1 label-row accuracy | Val top-5 hit | Missing train classes |",
+            "|---|---:|---:|---:|---:|---:|---:|---|",
         ]
         if jepa_source is not None:
             lines[2:2] = [
                 f"JEPA checkpoint: `{jepa_source['checkpoint_path']}`",
                 f"Checkpoint key: `{jepa_source['checkpoint_key']}`",
             ]
+        if any(
+            rows and "val_top1_label_row_accuracy" not in rows[0]
+            for rows in metrics.values()
+        ):
+            lines.insert(
+                lines.index("![Training curves](training-curves.png)"),
+                "Older epoch CSVs lack label-row accuracy; the best checkpoints were re-evaluated below.",
+            )
         for model_name in MODELS:
             summary = summaries[model_name]
             val = summary["best_val"]
             values = (
                 f"{val['mean_average_precision'] * 100:.2f}",
                 f"{val['top1_hit'] * 100:.2f}",
+                f"{val['top1_label_row_accuracy'] * 100:.2f}",
                 f"{val['top5_hit'] * 100:.2f}",
-            ) if val is not None else ("-", "-", "-")
+            ) if val is not None else ("-", "-", "-", "-")
             lines.append(
                 f"| {model_name} | {summary['num_parameters']:,} | {summary['best_epoch']} | "
-                f"{values[0]} | {values[1]} | {values[2]} | "
+                f"{values[0]} | {values[1]} | {values[2]} | {values[3]} | "
                 f"{summary['missing_train_class_ids']} |"
             )
         lines.extend([
+            "", "## Model architecture", "",
+            *_architecture_descriptions(summaries),
             "", "## Files", "",
             "- [CNN metrics](cnn-metrics.csv)",
             "- [Transformer metrics](transformer-metrics.csv)",
@@ -1178,8 +1357,7 @@ def write_findings(
             "",
             "## Model architecture",
             "",
-            "- CNN: temporal ResNet, widths 256/384/512, two blocks per stage, masked mean pooling.",
-            "- Transformer: dim 256, 8 blocks, 8 heads, MLP ratio 4, learnable CLS-token pooling.",
+            *_architecture_descriptions(summaries),
             "",
             "## Raw metrics",
             "",
@@ -1211,6 +1389,14 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     task, dataset_name = classification_dataset_kind(
         Path(args.dataset_root).expanduser().resolve()
     )
+    pos_weight_mode = str(_argument(args, "pos_weight", "none"))
+    pos_weight_cap = float(_argument(args, "pos_weight_cap", 10.0))
+    if pos_weight_mode not in ("none", "sqrt_inverse_frequency"):
+        raise ValueError(f"Unknown positive class weighting mode: {pos_weight_mode}")
+    if not math.isfinite(pos_weight_cap) or pos_weight_cap < 1:
+        raise ValueError("--pos-weight-cap must be finite and at least 1")
+    if task != "multilabel" and pos_weight_mode != "none":
+        raise ValueError("Positive class weighting is supported only for BABEL")
     if input_source == "jepa":
         if checkpoint_value is None:
             raise ValueError("--jepa-checkpoint is required for --input-source jepa")
@@ -1218,17 +1404,17 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
         default_output = checkpoint_root / "linear-probe/classifiers"
         if task == "multilabel":
             default_output = default_output / dataset_name
-        default_findings = default_output / "findings"
     else:
         default_output = PROJECT_ROOT / f"output/{dataset_name}-classifiers"
-        default_findings = (
-            default_output / "findings"
-            if task == "multilabel" else DEFAULT_RAW_FINDINGS_ROOT
-        )
     output_root = (
         Path(output_value).expanduser().resolve()
         if output_value is not None
         else default_output
+    )
+    default_findings = (
+        output_root / "findings"
+        if task == "multilabel" or input_source == "jepa"
+        else DEFAULT_RAW_FINDINGS_ROOT
     )
     findings_root = (
         Path(findings_value).expanduser().resolve()
@@ -1303,6 +1489,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-lr", type=float, default=1.0e-6)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--pos-weight",
+        choices=("none", "sqrt_inverse_frequency"),
+        default="none",
+        help="BABEL only: weight each positive class by capped sqrt(negative/positive)",
+    )
+    parser.add_argument("--pos-weight-cap", type=float, default=10.0)
     parser.add_argument(
         "--use-bfloat16",
         action=argparse.BooleanOptionalAction,

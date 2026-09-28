@@ -49,6 +49,7 @@ class BabelLabelIndex:
     class_names: tuple[str, ...]
     class_to_index: dict[str, int]
     labels_by_path: dict[str, tuple[int, ...]]
+    row_labels_by_path: dict[str, tuple[int, ...]]
     path_by_id: dict[str, str]
 
     @property
@@ -97,7 +98,7 @@ def load_babel_label_index(root: str | Path) -> BabelLabelIndex:
     records = json.loads((root / "index.json").read_text(encoding="utf-8"))
     if not isinstance(records, list) or not records:
         raise ValueError("BABEL index.json is empty or malformed")
-    grouped: dict[str, set[int]] = {}
+    row_labels: dict[str, list[int]] = {}
     path_by_id: dict[str, str] = {}
     path_split: dict[str, str] = {}
     for record in records:
@@ -119,11 +120,12 @@ def load_babel_label_index(root: str | Path) -> BabelLabelIndex:
             raise ValueError(f"Invalid or conflicting BABEL index row: {record!r}")
         path_by_id[sample_id] = path
         path_split[path] = split
-        grouped.setdefault(path, set()).add(label)
+        row_labels.setdefault(path, []).append(label)
     return BabelLabelIndex(
         class_names,
         {name: index for index, name in enumerate(class_names)},
-        {path: tuple(sorted(labels)) for path, labels in grouped.items()},
+        {path: tuple(sorted(set(labels))) for path, labels in row_labels.items()},
+        {path: tuple(labels) for path, labels in row_labels.items()},
         path_by_id,
     )
 

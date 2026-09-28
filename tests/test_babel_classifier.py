@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import tempfile
@@ -100,6 +101,7 @@ class BabelClassifierTest(unittest.TestCase):
                 datasets["train"].labels, datasets["train"].sample_ids,
             )}
             torch.testing.assert_close(targets["motions/train/train-a1.npy"][:3], torch.tensor([1., 1., 0.]))
+            self.assertEqual(index.row_labels_by_path["motions/train/train-a1.npy"], (0, 1))
             self.assertEqual(datasets["train"][1][0].shape, (4, 6))
 
     def test_absent_test_files_are_an_empty_split(self):
@@ -114,17 +116,43 @@ class BabelClassifierTest(unittest.TestCase):
             self.assertEqual(len(datasets["test"]), 0)
 
     def test_ap_excludes_absent_classes_and_hits_use_any_positive(self):
-        metric = train_classifier.MultiLabelMetricAccumulator(3)
+        metric = train_classifier.MultiLabelMetricAccumulator(
+            3, {"a": (0, 0), "b": (1,), "c": (0,)}
+        )
         metric.update(
             torch.tensor([[.9, .1, 0.], [.8, .9, 0.], [.1, .8, 0.]]),
             torch.tensor([[1., 0., 0.], [0., 1., 0.], [1., 0., 0.]]),
             3.0,
+            ["a", "b", "c"],
         )
         result = metric.compute()
         self.assertAlmostEqual(result.mean_average_precision, (5/6 + 1)/2)
         self.assertAlmostEqual(result.top1_hit, 2/3)
+        self.assertAlmostEqual(result.top1_label_row_accuracy, 3/4)
         self.assertEqual(result.top5_hit, 1.0)
         self.assertEqual(result.classes_without_positives, 1)
+
+    def test_label_row_accuracy_counts_each_original_label(self):
+        metric = train_classifier.MultiLabelMetricAccumulator(
+            3, {"multi": (0, 1, 1), "single": (1,)}
+        )
+        metric.update(
+            torch.tensor([[3., 2., 0.], [0., 3., 1.]]),
+            torch.tensor([[1., 1., 0.], [0., 1., 0.]]),
+            0.0,
+            ["multi", "single"],
+        )
+        result = metric.compute()
+        self.assertEqual(result.top1_hit, 1.0)
+        self.assertEqual(result.top1_label_row_accuracy, 0.5)
+
+    def test_positive_weights_use_train_frequency_and_cap(self):
+        targets = torch.tensor([
+            [1., 0., 0.], [0., 1., 0.],
+            [0., 1., 0.], [0., 1., 0.],
+        ])
+        weights = train_classifier._positive_class_weights(targets, cap=1.5)
+        torch.testing.assert_close(weights, torch.tensor([1.5, 1., 1.]))
 
     def test_raw_training_empty_test_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -142,6 +170,17 @@ class BabelClassifierTest(unittest.TestCase):
             with mock.patch.object(train_classifier, "_atomic_torch_save", side_effect=interrupt):
                 with self.assertRaisesRegex(RuntimeError, "interrupted"):
                     train_classifier.run(args)
+            metrics_path = output / "linear/seed-42/metrics.csv"
+            with metrics_path.open(encoding="utf-8", newline="") as file:
+                rows = list(csv.DictReader(file))
+                legacy_fields = [
+                    field for field in rows[0]
+                    if not field.endswith("top1_label_row_accuracy")
+                ]
+            with metrics_path.open("w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=legacy_fields)
+                writer.writeheader()
+                writer.writerows({field: row[field] for field in legacy_fields} for row in rows)
             args.resume = True
             summary = train_classifier.run(args)["linear"]
             self.assertEqual(summary["selection_metric"], "val_mean_average_precision")
@@ -149,6 +188,21 @@ class BabelClassifierTest(unittest.TestCase):
             self.assertEqual(summary["split_counts"], {"train": 4, "val": 2, "test": 0})
             self.assertIn(2, summary["missing_train_class_ids"])
             self.assertEqual(summary["best_val"]["classes_with_positives"], 2)
+            self.assertIn("top1_label_row_accuracy", summary["best_val"])
+            with metrics_path.open(encoding="utf-8", newline="") as file:
+                resumed_rows = list(csv.DictReader(file))
+            self.assertEqual(len(resumed_rows), 2)
+            self.assertEqual(resumed_rows[0]["val_top1_label_row_accuracy"], "")
+            self.assertNotEqual(resumed_rows[1]["val_top1_label_row_accuracy"], "")
+            summary_path = output / "linear/seed-42/summary.json"
+            saved = json.loads(summary_path.read_text(encoding="utf-8"))
+            del saved["best_val"]["top1_label_row_accuracy"]
+            summary_path.write_text(json.dumps(saved), encoding="utf-8")
+            refreshed = train_classifier.run(args)["linear"]
+            self.assertEqual(
+                refreshed["best_val"]["top1_label_row_accuracy"],
+                summary["best_val"]["top1_label_row_accuracy"],
+            )
 
     def test_jepa_token_cache_has_multihot_labels_and_no_test_extraction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -166,24 +220,32 @@ class BabelClassifierTest(unittest.TestCase):
             self.assertEqual(payload["labels"].dtype, torch.float32)
             self.assertFalse((cache / "test.pt").exists())
             self.assertIsNone(summary["test"])
+            self.assertIn("top1_label_row_accuracy", summary["best_val"])
 
     def test_both_networks_write_report_without_test_labels(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "data"
             output = Path(directory) / "out"
-            findings = Path(directory) / "findings"
+            findings = output / "findings"
             _write_babel_dataset(root)
             args = _args(root, output)
             args.model = "all"
             args.epochs = 1
-            args.findings_root = findings
+            args.pos_weight = "sqrt_inverse_frequency"
+            args.pos_weight_cap = 10.0
             summaries = train_classifier.run(args)
             self.assertEqual(set(summaries), {"cnn", "transformer"})
             self.assertTrue(all(summary["test"] is None for summary in summaries.values()))
+            self.assertTrue(all(summary["pos_weight"]["mode"] == "sqrt_inverse_frequency" for summary in summaries.values()))
             report = (findings / "README.md").read_text()
             self.assertIn("BABEL-60 multi-label", report)
             self.assertIn("Val mean AP", report)
+            self.assertIn("Val top-1 label-row accuracy", report)
+            self.assertIn("positive weights", report)
             self.assertTrue((findings / "training-curves.png").is_file())
+            args.pos_weight = "none"
+            with self.assertRaises(FileExistsError):
+                train_classifier.run(args)
 
 
 if __name__ == "__main__":
