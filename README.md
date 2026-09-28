@@ -17,7 +17,7 @@ motion_rep/       366-D representation and geometry
 skeleton/         BVH parsing, SOMA skeletons, kinematics, and assets
 visualization/    viser dataset viewer, skeleton renderer, and skinning
 utils/            distributed, logging, scheduler, and tensor helpers
-configs/          `_1d` and `_2d` pretraining configurations
+configs/          active pretraining config and `_depr_experiments/` archive
 train.py          shared JEPA training loop
 main.py           local-device and torchrun entry point
 ```
@@ -136,8 +136,8 @@ configuration with:
 
 ```bash
 python visualize_mask.py \
-  --config configs/mjepa_patch_2d_base_fine11.yaml \
-  --output output/mask-patch-2d-fine11.png \
+  --config configs/mjepa_patch_2d_tiny_coarse7.yaml \
+  --output output/mask-patch-2d-trajectory-coarse7.png \
   --seed 0 \
   --valid-length 90
 ```
@@ -146,36 +146,24 @@ The renderer automatically uses a timeline for 1D layouts and a
 time-by-joint/body-group grid for 2D layouts. Patch timelines annotate both
 token indices and their corresponding raw-frame spans.
 
-For coarse7, set `mask.strategy: body_region_segment` to predict one
-graph-connected body region over a contiguous time segment. Configure the
-temporal extent with `pred_frame_mask_ratio` and the number of connected body
-groups with `graph_mask_ratio`. `num_regions` samples that many cell-disjoint
-segments and trains on their union; the encoder observes the exact complement
-of the target over valid tokens. See
-`configs/mjepa_patch_2d_tiny_coarse7_body_region_segment.yaml` for the default
-2–3 group, 30–60% temporal setup. Omitting `mask.strategy` preserves the
-original multiblock behavior.
-
-Set `mask.strategy: random_body_segment` to sample several separate target
-masks, each formed by a contiguous temporal segment over uniformly random
-coarse7 body groups. Target masks are cell-disjoint, the encoder observes their
-exact complement, and `body_mask_ratio` controls only how many of the seven
-groups each target selects; it does not use the skeleton graph. See
-`configs/mjepa_patch_2d_tiny_coarse7_part1-3_frame15-25.yaml` for the
-four-target, 1–3 group, 15–25% temporal setup. The matching one-group control
-is `configs/mjepa_patch_2d_tiny_coarse7_part1_frame15-25.yaml`.
+The active `random_spatial_segment` strategy samples four target masks. Each
+mask spans a contiguous 40–60% of the patch timeline and exactly four of the
+eight trajectory/body tokens. Targets may overlap, but their union is
+constrained to 55–65% and the encoder receives its exact complement. Historical
+mask experiments remain under `configs/_depr_experiments/`.
 
 ## Model variants
 
 `_1d` uses one token per 366-D frame and temporal transformer attention. Its
 context and target masks are contiguous temporal blocks.
 
-`_2d` routes the representation into a `[frames,30 joints]` grid. Each joint
-receives its own position, rotation, and velocity fields; root position and
-heading go to the root token, while the four contact values go to their
-corresponding foot/toe tokens. Encoder blocks apply temporal attention per
-joint followed by spatial attention per frame. The predictor retains separate
-context and target-query streams, including when their coordinates overlap.
+Patchified `_2d` routes canonical root x/z and heading to a trajectory token,
+then appends the configured body groups. Coarse7 therefore produces a
+`[patches,8]` grid. Root height, rotation, and velocity stay in the pelvis body
+token. Separate trajectory/body patch projections and learned spatial
+positions identify the streams; there is no token-type embedding. Encoder
+blocks apply temporal attention per spatial token followed by spatial
+attention per patch. Non-patch `_2d` retains the original 30-joint routing.
 
 Named factories are available for `tiny`, `small`, `base`, `large`, `huge`,
 and `giant`, for example `mot_base_1d` and `mot_base_2d`. There are no
@@ -188,14 +176,14 @@ Batch size is per rank. Learning rates are not automatically scaled.
 Single GPU:
 
 ```bash
-python main.py --fname configs/mjepa_1d.yaml --devices cuda:0
+python main.py --config configs/mjepa_patch_2d_tiny_coarse7.yaml --devices cuda:0
 ```
 
 Local multi-GPU:
 
 ```bash
 python main.py \
-  --fname configs/mjepa_2d.yaml \
+  --config configs/mjepa_patch_2d_tiny_coarse7.yaml \
   --devices cuda:0 cuda:1 cuda:2 cuda:3
 ```
 
@@ -206,7 +194,7 @@ Standard torchrun launch:
 
 ```bash
 torchrun --standalone --nproc-per-node=4 main.py \
-  --fname configs/mjepa_1d.yaml
+  --config configs/mjepa_patch_2d_tiny_coarse7.yaml
 ```
 
 `main.py` honors `RANK`, `WORLD_SIZE`, and `LOCAL_RANK`. CUDA training uses
@@ -215,7 +203,7 @@ for Submitit/SLURM launches.
 
 Checkpoints contain unwrapped encoder and predictor weights, the EMA target,
 optimizer, optional AMP scaler, all schedules, epoch/global step, mask state,
-and per-rank Python/NumPy/PyTorch RNG states. Writes are atomic. Exact resume
+latest online diagnostics, and per-rank Python/NumPy/PyTorch RNG states. Writes are atomic. Exact resume
 requires the same world size and continues from the latest completed epoch:
 
 ```yaml
@@ -223,6 +211,14 @@ meta:
   load_checkpoint: true
   read_checkpoint: null  # null selects <write_tag>-latest.pth.tar
 ```
+
+The active config also evaluates a fixed unlabeled validation subset at the
+linear-probe cadence. TensorBoard receives RankMe, feature variance, sample
+cosine, covariance-spectrum, held-out JEPA, PredictionGain, and trajectory
+reliance metrics under `online_metrics/`. Full summaries are appended to
+`online-metrics.jsonl`; they are diagnostic and do not select checkpoints. See
+`agent/ONLINE_REPRESENTATION_METRICS.md` for definitions and
+`agent/MOTION_JEPA_TRAJECTORY.md` for the deferred cross-attention design.
 
 BF16 autocast is controlled by `meta.use_bfloat16`. BF16 does not use a
 gradient scaler; optional FP16 training uses `meta.use_float16` and restores
@@ -325,6 +321,26 @@ LR sweeps and validation-selected reports reject validation-free datasets.
 They are retained only for legacy datasets with a genuine non-empty validation
 split, preventing `FW` test results from becoming an implicit tuning set.
 
+For an explicitly diagnostic LR-sensitivity check on immutable 2D checkpoints,
+use `--diagnostic-no-validation`, list the checkpoints, and retain spatial token
+identity with `temporal_mean_spatial_flatten`. This reports every FW result but
+does not make it a valid LR-selection criterion:
+
+```bash
+python -m experiment.linear_probe.lr_sweep \
+  --checkpoints output/<run>/*-ep*.pth.tar \
+  --pooling temporal_mean_spatial_flatten \
+  --diagnostic-no-validation \
+  --lrs 0.1 0.3 0.5 0.7 1.0 \
+  --seeds 42 \
+  --findings-root findings/<diagnostic-name> \
+  --device cuda:0
+```
+
+Features are extracted once per checkpoint and reused across learning rates.
+Completed probe runs resume from their summaries unless `--overwrite-runs` is
+given.
+
 The sweep writes its component artifacts to
 `findings/000-100style-classification/linear-probe` by default.
 
@@ -338,6 +354,21 @@ python -m experiment.linear_probe.train_classifier \
   --seed 42 \
   --device cuda:0
 ```
+
+Train the single-layer normalized raw-motion baseline with the same data
+loader, optimizer, schedule, metrics, and checkpointing entry point:
+
+```bash
+python -m experiment.linear_probe.linear \
+  --dataset-root dataset/100style-soma77-processed \
+  --device cuda:0
+```
+
+This model takes the masked temporal mean of each normalized `[90,366]` window
+and applies exactly one `Linear(366, 100)` layer. On the validation-free
+content split it saves the final epoch as `classifier-final.pth.tar` and then
+evaluates `FW` once. The equivalent shared-runner command is
+`python -m experiment.linear_probe.train_classifier --model linear ...`.
 
 The same classifiers can consume frozen frame-token features from a pretrained
 1D Motion-JEPA target encoder:

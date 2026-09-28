@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import random
@@ -32,6 +33,7 @@ from mask import (
     PatchMaskCollator1D,
     PatchMaskCollator2D,
     PatchRandomBodySegmentMaskCollator2D,
+    PatchRandomSpatialSegmentMaskCollator2D,
 )
 from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from mask.utils import (
@@ -126,6 +128,30 @@ def _write_tensorboard_linear_probe(
     writer.flush()
 
 
+def _flatten_numeric_metrics(prefix: str, values: dict) -> dict[str, float]:
+    flattened: dict[str, float] = {}
+    for name, value in values.items():
+        key = f"{prefix}/{name}" if prefix else str(name)
+        if isinstance(value, dict):
+            flattened.update(_flatten_numeric_metrics(key, value))
+        elif isinstance(value, (int, float)):
+            flattened[key] = float(value)
+    return flattened
+
+
+def _write_tensorboard_online_metrics(
+    writer,
+    *,
+    global_step: int,
+    summary: dict,
+) -> None:
+    if writer is None:
+        return
+    for name, value in _flatten_numeric_metrics("online_metrics", summary).items():
+        writer.add_scalar(name, value, global_step)
+    writer.flush()
+
+
 @torch.no_grad()
 def update_ema(online, target, momentum: float) -> None:
     for online_parameter, target_parameter in zip(
@@ -160,6 +186,20 @@ def _evaluate_online_probe_preserving_rng(evaluator, encoder) -> dict:
     try:
         return evaluator.evaluate(encoder)
     finally:
+        restore_rng_state(rng_state)
+
+
+def _evaluate_online_metrics_preserving_rng(evaluator, encoder, predictor) -> dict:
+    rng_state = capture_rng_state()
+    encoder_training = encoder.training
+    predictor_training = predictor.training
+    try:
+        encoder.eval()
+        predictor.eval()
+        return evaluator.evaluate(encoder, predictor)
+    finally:
+        encoder.train(encoder_training)
+        predictor.train(predictor_training)
         restore_rng_state(rng_state)
 
 
@@ -198,6 +238,7 @@ def _save_checkpoint(
     linear_probe_latest: dict | None = None,
     best_probe_val_top1: float = float("-inf"),
     best_probe_epoch: int | None = None,
+    online_metrics_latest: dict | None = None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
     mask_states = all_gather_objects(mask_collator.state_dict())
@@ -223,6 +264,7 @@ def _save_checkpoint(
         "linear_probe_latest": linear_probe_latest,
         "best_probe_val_top1": float(best_probe_val_top1),
         "best_probe_epoch": best_probe_epoch,
+        "online_metrics_latest": online_metrics_latest,
     }
     if architecture is not None:
         payload["architecture"] = architecture
@@ -246,6 +288,7 @@ def _load_checkpoint(
     world_size: int,
     architecture: dict | None = None,
     linear_probe_state: dict | None = None,
+    online_metrics_state: dict | None = None,
 ) -> tuple[int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
     # optimizer state, and scheduler state in addition to tensor weights.
@@ -285,12 +328,44 @@ def _load_checkpoint(
             best_val_top1=float(checkpoint.get("best_probe_val_top1", float("-inf"))),
             best_epoch=checkpoint.get("best_probe_epoch"),
         )
+    if online_metrics_state is not None:
+        online_metrics_state["latest"] = checkpoint.get("online_metrics_latest")
     return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
 
 
 def _build_mask_collator(args: dict, layout: TokenLayout):
     mask = args["mask"]
     strategy = str(mask.get("strategy", "multiblock"))
+    if strategy == "random_spatial_segment":
+        if layout.kind != "2d" or not layout.patchified:
+            raise ValueError(
+                "mask.strategy='random_spatial_segment' requires patchified 2D tokens"
+            )
+        patch = args["patch"]
+        if int(mask["num_enc_masks"]) != 1:
+            raise ValueError(
+                "mask.strategy='random_spatial_segment' requires one encoder mask"
+            )
+        if not bool(mask.get("allow_target_overlap", False)):
+            raise ValueError(
+                "random_spatial_segment requires allow_target_overlap=true"
+            )
+        if bool(mask.get("allow_context_target_overlap", False)):
+            raise ValueError(
+                "random_spatial_segment requires allow_context_target_overlap=false"
+            )
+        return PatchRandomSpatialSegmentMaskCollator2D(
+            raw_num_frames=layout.raw_num_frames,
+            raw_num_joints=int(layout.raw_num_joints),
+            token_num_joints=int(layout.token_num_joints),
+            temporal_patch_size=layout.temporal_patch_size,
+            spatial_grouping=str(patch["spatial_grouping"]),
+            spatial_pooling=str(patch["spatial_pooling"]),
+            pred_frame_mask_ratio=tuple(mask["pred_frame_mask_ratio"]),
+            pred_spatial_mask_count=int(mask["pred_spatial_mask_count"]),
+            target_union_ratio=tuple(mask["target_union_ratio"]),
+            npred=int(mask["num_pred_masks"]),
+        )
     if strategy == "random_body_segment":
         if layout.kind != "2d" or not layout.patchified:
             raise ValueError(
@@ -352,7 +427,7 @@ def _build_mask_collator(args: dict, layout: TokenLayout):
     if strategy != "multiblock":
         raise ValueError(
             f"Unknown mask.strategy {strategy!r}; choose one of: "
-            "body_region_segment, random_body_segment, multiblock"
+            "body_region_segment, random_body_segment, random_spatial_segment, multiblock"
         )
     common = dict(
         enc_frame_mask_ratio=tuple(mask["enc_frame_mask_ratio"]),
@@ -433,10 +508,14 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     if not isinstance(probe_args, dict):
         raise ValueError("linear_probe config must be a mapping")
     probe_enabled = bool(probe_args.get("enabled", False))
+    metric_args = args.get("online_metrics", {})
+    if not isinstance(metric_args, dict):
+        raise ValueError("online_metrics config must be a mapping")
+    metrics_enabled = bool(metric_args.get("enabled", False))
     probe_frequency = int(
         probe_args.get("frequency", log_args.get("checkpoint_freq", 50))
     )
-    if probe_enabled and probe_frequency <= 0:
+    if (probe_enabled or metrics_enabled) and probe_frequency <= 0:
         raise ValueError("linear_probe.frequency must be positive")
     model_name = str(meta_args["model_name"])
     if model_name not in MODEL_FACTORIES:
@@ -518,6 +597,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         "best_val_top1": float("-inf"),
         "best_epoch": None,
     }
+    online_metrics_state = {"latest": None}
     latest_path = output / f"{log_args['write_tag']}-latest.pth.tar"
     best_accuracy_path = output / f"{log_args['write_tag']}-best-accuracy.pth.tar"
     should_load = resume_requested
@@ -542,6 +622,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             world_size=world_size,
             architecture=architecture,
             linear_probe_state=linear_probe_state,
+            online_metrics_state=online_metrics_state,
         )
         logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
 
@@ -592,6 +673,23 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             online_linear_probe.dataset_root,
             online_linear_probe.epochs,
             online_linear_probe.learning_rate,
+            probe_frequency,
+        )
+
+    online_metrics = None
+    if metrics_enabled and distributed.is_main:
+        from experiment.online_metrics import OnlineRepresentationMetrics
+
+        online_metrics = OnlineRepresentationMetrics(
+            args,
+            metric_args,
+            device=device,
+            collator=_build_mask_collator(args, layout),
+        )
+        logger.info(
+            "Enabled online representation metrics on %d fixed validation samples "
+            "(frequency=%d)",
+            len(online_metrics.indices),
             probe_frequency,
         )
 
@@ -665,15 +763,51 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             )
         return improved
 
+    def run_online_representation_metrics(pretrain_epoch: int) -> None:
+        if not distributed.is_main:
+            return
+        if online_metrics is None:
+            raise RuntimeError("Online representation metrics were not initialized")
+        summary = _evaluate_online_metrics_preserving_rng(
+            online_metrics, target_encoder, _unwrapped(predictor)
+        )
+        summary = {
+            "pretrain_epoch": int(pretrain_epoch),
+            "global_step": int(global_step),
+            **summary,
+        }
+        online_metrics_state["latest"] = summary
+        _write_tensorboard_online_metrics(
+            tensorboard_writer, global_step=global_step, summary=summary
+        )
+        with (output / "online-metrics.jsonl").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(summary, sort_keys=True) + "\n")
+        heldout = summary["heldout_jepa"]
+        logger.info(
+            "epoch=%d online_metrics rankme=%.3f body_std=%.4g "
+            "prediction_gain=%.4f trajectory_reliance=%.4f",
+            pretrain_epoch,
+            summary["representation"]["body"]["rankme"],
+            summary["representation"]["body"]["mean_std"],
+            heldout["prediction_gain"],
+            heldout["trajectory_ablation"]["trajectory_reliance"],
+        )
+
     # Establish a frozen-encoder baseline before the first optimization step.
     # A resumed epoch-0 checkpoint already contains this result, so do not
     # repeat the relatively expensive probe in that case.
-    if (
-        probe_enabled
-        and start_epoch == 0
-        and linear_probe_state["latest"] is None
-    ):
-        initial_probe_improved = run_online_linear_probe(pretrain_epoch=0)
+    needs_initial_probe = (
+        probe_enabled and start_epoch == 0 and linear_probe_state["latest"] is None
+    )
+    needs_initial_metrics = (
+        metrics_enabled and start_epoch == 0 and online_metrics_state["latest"] is None
+    )
+    if needs_initial_probe or needs_initial_metrics:
+        initial_probe_improved = (
+            run_online_linear_probe(pretrain_epoch=0) if needs_initial_probe else False
+        )
+        if needs_initial_metrics:
+            run_online_representation_metrics(pretrain_epoch=0)
         _save_checkpoint(
             latest_path,
             encoder=encoder,
@@ -695,6 +829,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             linear_probe_latest=linear_probe_state["latest"],
             best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
             best_probe_epoch=linear_probe_state["best_epoch"],
+            online_metrics_latest=online_metrics_state["latest"],
         )
         if distributed.is_main and initial_probe_improved:
             _atomic_copy(latest_path, best_accuracy_path)
@@ -833,6 +968,11 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         probe_improved = False
         if should_probe and distributed.is_main:
             probe_improved = run_online_linear_probe(pretrain_epoch=epoch + 1)
+        should_measure = metrics_enabled and (
+            (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
+        )
+        if should_measure and distributed.is_main:
+            run_online_representation_metrics(pretrain_epoch=epoch + 1)
 
         _save_checkpoint(
             latest_path,
@@ -855,6 +995,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             linear_probe_latest=linear_probe_state["latest"],
             best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
             best_probe_epoch=linear_probe_state["best_epoch"],
+            online_metrics_latest=online_metrics_state["latest"],
         )
         if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
             checkpoint_path = output / f"{log_args['write_tag']}-ep{epoch + 1}.pth.tar"

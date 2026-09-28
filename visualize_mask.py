@@ -113,7 +113,10 @@ def sample_masks(
     if batch_size <= 0 or not 0 <= sample_index < batch_size:
         raise ValueError("sample_index must select an item in batch_size")
     if allow_overlap is not None:
-        config["mask"]["allow_overlap"] = bool(allow_overlap)
+        if "allow_target_overlap" in config["mask"]:
+            config["mask"]["allow_target_overlap"] = bool(allow_overlap)
+        else:
+            config["mask"]["allow_overlap"] = bool(allow_overlap)
 
     layout, architecture = _layout_from_config(config)
     collator = _build_mask_collator(config, layout)
@@ -133,7 +136,9 @@ def sample_masks(
         if spatial_patch is None:
             spatial_labels = tuple(SOMASkeleton30(load=False).names)
         else:
-            spatial_labels = tuple(spatial_patch["group_names"])
+            spatial_labels = tuple(
+                spatial_patch.get("spatial_token_names", spatial_patch["group_names"])
+            )
     valid_tokens = int(
         layout.valid_token_lengths(torch.tensor([valid_raw_frames]))[0]
     )
@@ -142,7 +147,11 @@ def sample_masks(
         layout=layout,
         valid_raw_frames=valid_raw_frames,
         valid_token_frames=valid_tokens,
-        allow_overlap=bool(config["mask"]["allow_overlap"]),
+        allow_overlap=bool(
+            config["mask"].get(
+                "allow_target_overlap", config["mask"].get("allow_overlap", False)
+            )
+        ),
         contexts=tuple(
             _mask_to_numpy(mask, layout=layout, sample_index=sample_index)
             for mask in context_masks
@@ -391,7 +400,11 @@ def render_mask_png(output: Path, sampled: SampledMasks, *, seed: int = 0) -> di
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("configs/mjepa_1d_base.yaml"))
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/mjepa_patch_2d_tiny_coarse7.yaml"),
+    )
     parser.add_argument("--output", type=Path, default=Path("output/mask.png"))
     parser.add_argument("--seed", type=int, default=0, help="Mask collator step/seed.")
     parser.add_argument("--valid-length", type=int, help="Valid raw frames.")

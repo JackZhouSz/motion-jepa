@@ -25,6 +25,9 @@ from .token_layout import TokenLayout
 
 SPATIAL_POOLING = "graph_mean"
 SPATIAL_GRAPH_VERSION = 1
+TRAJECTORY_TOKEN_INDEX = 0
+BODY_TOKEN_OFFSET = 1
+TRAJECTORY_FIELDS = ("root_x", "root_z", "heading_cos", "heading_sin")
 _PACKED_ENCODER_ATTENTION = True
 _PACKED_PREDICTOR_ATTENTION = True
 
@@ -107,6 +110,12 @@ def spatial_patch_signature(name: str) -> dict:
         "spatial_pooling": SPATIAL_POOLING,
         "spatial_graph_version": SPATIAL_GRAPH_VERSION,
         "group_names": [group_name for group_name, _ in groups],
+        "spatial_token_names": [
+            "trajectory", *[group_name for group_name, _ in groups]
+        ],
+        "trajectory_token_index": TRAJECTORY_TOKEN_INDEX,
+        "body_token_offset": BODY_TOKEN_OFFSET,
+        "trajectory_fields": list(TRAJECTORY_FIELDS),
         "joint_groups": [list(joints) for _, joints in groups],
         "joint_names": list(skeleton.names),
         "graph_edges": edges,
@@ -166,7 +175,7 @@ class _TemporalGraphMeanStem(nn.Module):
         self.groups = get_spatial_grouping(spatial_grouping_name)
         tokenizer = MotionFeatureTokenizer2D(embed_dim=embed_dim)
         self.num_joints = tokenizer.NUM_JOINTS
-        self.joint_input_dim = max(tokenizer.input_dims)
+        self.trajectory_input_dim = len(TRAJECTORY_FIELDS)
         self.embed_dim = int(embed_dim)
 
         # Grouped convolution requires an equal channel count per joint. Route
@@ -174,10 +183,16 @@ class _TemporalGraphMeanStem(nn.Module):
         # slots at one appended zero channel. Groups keep every joint's weights
         # independent while issuing one convolution instead of 30 small ones.
         padding_index = tokenizer.FEATURE_DIM
+        self.register_buffer(
+            "trajectory_feature_indices",
+            torch.tensor((0, 2, 3, 4), dtype=torch.long),
+            persistent=False,
+        )
         feature_indices = []
+        body_input_dims = []
         for joint, input_dim in enumerate(tokenizer.input_dims):
             if joint == 0:
-                indices = list(range(0, 5))
+                indices = [1]
             else:
                 local_start = 5 + 3 * (joint - 1)
                 indices = list(range(local_start, local_start + 3))
@@ -186,13 +201,14 @@ class _TemporalGraphMeanStem(nn.Module):
             contact = tokenizer.contact_by_joint.get(joint)
             if contact is not None:
                 indices.append(362 + contact)
-            if len(indices) != input_dim:
-                raise RuntimeError(
-                    f"Joint {joint} routing has {len(indices)} fields, expected {input_dim}"
-                )
-            feature_indices.append(
-                indices + [padding_index] * (self.joint_input_dim - input_dim)
-            )
+            body_input_dims.append(len(indices))
+            feature_indices.append(indices)
+        self.body_input_dims = tuple(body_input_dims)
+        self.joint_input_dim = max(self.body_input_dims)
+        feature_indices = [
+            indices + [padding_index] * (self.joint_input_dim - len(indices))
+            for indices in feature_indices
+        ]
         self.register_buffer(
             "joint_feature_indices",
             torch.tensor(feature_indices, dtype=torch.long),
@@ -204,6 +220,12 @@ class _TemporalGraphMeanStem(nn.Module):
             kernel_size=temporal_patch_size,
             stride=temporal_patch_size,
             groups=self.num_joints,
+        )
+        self.trajectory_conv = nn.Conv1d(
+            self.trajectory_input_dim,
+            self.embed_dim,
+            kernel_size=temporal_patch_size,
+            stride=temporal_patch_size,
         )
         self.graph_projection = nn.Linear(embed_dim, embed_dim)
         self.activation = nn.GELU()
@@ -217,6 +239,9 @@ class _TemporalGraphMeanStem(nn.Module):
         nn.init.trunc_normal_(self.temporal_conv.weight, std=0.02)
         if self.temporal_conv.bias is not None:
             nn.init.zeros_(self.temporal_conv.bias)
+        nn.init.trunc_normal_(self.trajectory_conv.weight, std=0.02)
+        if self.trajectory_conv.bias is not None:
+            nn.init.zeros_(self.trajectory_conv.bias)
 
     def forward(self, motion: torch.Tensor) -> torch.Tensor:
         if motion.ndim != 3 or motion.shape[-1] != MotionFeatureTokenizer2D.FEATURE_DIM:
@@ -224,6 +249,8 @@ class _TemporalGraphMeanStem(nn.Module):
                 f"2D tokenization requires motion [B,T,{MotionFeatureTokenizer2D.FEATURE_DIM}], "
                 f"got {tuple(motion.shape)}"
             )
+        trajectory = motion[..., self.trajectory_feature_indices].transpose(1, 2)
+        trajectory = self.trajectory_conv(trajectory).transpose(1, 2).unsqueeze(2)
         padded_motion = F.pad(motion, (0, 1))
         routed = padded_motion[..., self.joint_feature_indices]
         routed = routed.permute(0, 2, 3, 1).reshape(
@@ -235,7 +262,8 @@ class _TemporalGraphMeanStem(nn.Module):
         ).permute(0, 3, 1, 2)
         mixed = torch.einsum("ij,btjd->btid", self.adjacency, joints)
         joints = self.activation(joints + self.graph_projection(mixed))
-        return torch.matmul(self.group_pool, joints)
+        body = torch.matmul(self.group_pool, joints)
+        return torch.cat([trajectory, body], dim=2)
 
 
 class MotionPatchTransformer2D(nn.Module):
@@ -274,7 +302,10 @@ class MotionPatchTransformer2D(nn.Module):
         self.spatial_grouping = str(spatial_grouping)
         self.spatial_pooling = str(spatial_pooling)
         self.groups = get_spatial_grouping(self.spatial_grouping)
-        self.token_num_joints = len(self.groups)
+        self.spatial_token_names = (
+            "trajectory", *[group_name for group_name, _ in self.groups]
+        )
+        self.token_num_joints = len(self.spatial_token_names)
         self.embed_dim = int(embed_dim)
         self.num_heads = int(num_heads)
         self.token_layout = TokenLayout(
@@ -285,6 +316,10 @@ class MotionPatchTransformer2D(nn.Module):
             temporal_patch_size=self.temporal_patch_size,
             raw_num_joints=self.num_joints,
             token_num_joints=self.token_num_joints,
+            trajectory_token_index=TRAJECTORY_TOKEN_INDEX,
+            body_token_offset=BODY_TOKEN_OFFSET,
+            spatial_token_names=self.spatial_token_names,
+            trajectory_fields=TRAJECTORY_FIELDS,
         )
         self.patch_embed = _TemporalGraphMeanStem(
             self.embed_dim, self.temporal_patch_size, self.spatial_grouping
@@ -436,7 +471,10 @@ class MotionPatchTransformerPredictor2D(nn.Module):
         self.spatial_grouping = str(spatial_grouping)
         self.spatial_pooling = str(spatial_pooling)
         self.groups = get_spatial_grouping(self.spatial_grouping)
-        self.token_num_joints = len(self.groups)
+        self.spatial_token_names = (
+            "trajectory", *[group_name for group_name, _ in self.groups]
+        )
+        self.token_num_joints = len(self.spatial_token_names)
         self.embed_dim = int(embed_dim)
         self.predictor_embed_dim = int(predictor_embed_dim)
         self.token_layout = TokenLayout(
@@ -447,6 +485,10 @@ class MotionPatchTransformerPredictor2D(nn.Module):
             temporal_patch_size=self.temporal_patch_size,
             raw_num_joints=self.num_joints,
             token_num_joints=self.token_num_joints,
+            trajectory_token_index=TRAJECTORY_TOKEN_INDEX,
+            body_token_offset=BODY_TOKEN_OFFSET,
+            spatial_token_names=self.spatial_token_names,
+            trajectory_fields=TRAJECTORY_FIELDS,
         )
         self.input_proj = nn.Linear(self.embed_dim, self.predictor_embed_dim)
         self.positions = _PatchGridPositions(

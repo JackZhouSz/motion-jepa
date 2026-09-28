@@ -50,6 +50,23 @@ class StyleLabelIndexTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_style_label_index(root)
 
+    def test_explicit_numeric_labels_preserve_declared_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {"id": "z", "metadata": {"label": 0, "label_name": "Zebra"}},
+                {"id": "a", "metadata": {"label": 1, "label_name": "Apple"}},
+            ]
+            (root / "index.json").write_text(json.dumps(records), encoding="utf-8")
+            (root / "meta.json").write_text(
+                json.dumps({"class_names": ["Zebra", "Apple"]}), encoding="utf-8"
+            )
+            index = load_style_label_index(root)
+            self.assertEqual(index.class_names, ("Zebra", "Apple"))
+            self.assertEqual(index.class_to_index, {"Zebra": 0, "Apple": 1})
+            self.assertEqual(index.label_for_sample("z"), 0)
+            self.assertEqual(index.label_for_sample("a"), 1)
+
 
 class StyleMotionDatasetTest(unittest.TestCase):
     def test_builder_shares_labels_and_returns_sample_ids(self):

@@ -1,5 +1,10 @@
 # 2D Temporal-Spatial Patchification
 
+> This document describes the earlier body-only patchification work. The active
+> trajectory-token layout and online diagnostics are documented in
+> `MOTION_JEPA_TRAJECTORY.md` and `ONLINE_REPRESENTATION_METRICS.md`. Historical
+> YAML configurations now live under `configs/_depr_experiments/`.
+
 ## Token geometry
 
 The separate patchified 2D family keeps `motion_jepa_366_v1` and its lossless

@@ -385,9 +385,182 @@ class PatchRandomBodySegmentMaskCollator2D(_StatefulMaskCollator):
         return collated_batch, contexts, targets
 
 
+class PatchRandomSpatialSegmentMaskCollator2D(_StatefulMaskCollator):
+    """Mask overlapping temporal rectangles over an integer spatial-token count."""
+
+    def __init__(
+        self,
+        raw_num_frames: int,
+        raw_num_joints: int,
+        token_num_joints: int,
+        temporal_patch_size: int = 3,
+        spatial_grouping: str = "coarse7",
+        spatial_pooling: str = "graph_mean",
+        pred_frame_mask_ratio: tuple[float, float] = (0.4, 0.6),
+        pred_spatial_mask_count: int = 4,
+        target_union_ratio: tuple[float, float] = (0.55, 0.65),
+        npred: int = 4,
+        max_sampling_attempts: int = 2048,
+    ) -> None:
+        super().__init__()
+        if spatial_pooling != "graph_mean":
+            raise ValueError(
+                "random_spatial_segment supports only spatial_pooling='graph_mean'"
+            )
+        expected_body_groups = {
+            "joint30": 30,
+            "fine11": 11,
+            "coarse7": 7,
+        }
+        if spatial_grouping not in expected_body_groups:
+            choices = ", ".join(sorted(expected_body_groups))
+            raise ValueError(
+                f"Unknown spatial_grouping {spatial_grouping!r}; choose one of: {choices}"
+            )
+        expected_tokens = 1 + expected_body_groups[spatial_grouping]
+        if int(raw_num_joints) != 30 or int(token_num_joints) != expected_tokens:
+            raise ValueError(
+                "random_spatial_segment requires SOMA30 with one trajectory token "
+                f"plus {expected_body_groups[spatial_grouping]} body tokens"
+            )
+        self.layout = TokenLayout(
+            kind="2d",
+            patchified=True,
+            raw_num_frames=int(raw_num_frames),
+            token_num_frames=int(raw_num_frames) // int(temporal_patch_size),
+            temporal_patch_size=int(temporal_patch_size),
+            raw_num_joints=int(raw_num_joints),
+            token_num_joints=int(token_num_joints),
+        )
+        self.spatial_grouping = str(spatial_grouping)
+        self.spatial_pooling = str(spatial_pooling)
+        self.pred_frame_mask_ratio = tuple(
+            float(value) for value in pred_frame_mask_ratio
+        )
+        self.pred_spatial_mask_count = int(pred_spatial_mask_count)
+        self.target_union_ratio = tuple(float(value) for value in target_union_ratio)
+        self.npred = int(npred)
+        self.max_sampling_attempts = int(max_sampling_attempts)
+        _sample_ratio(torch.Generator().manual_seed(0), self.pred_frame_mask_ratio)
+        _sample_ratio(torch.Generator().manual_seed(0), self.target_union_ratio)
+        if not 0 < self.pred_spatial_mask_count <= self.layout.token_num_joints:
+            raise ValueError(
+                "pred_spatial_mask_count must be in [1, token_num_joints]"
+            )
+        if self.npred <= 0 or self.max_sampling_attempts <= 0:
+            raise ValueError("npred and max_sampling_attempts must be positive")
+        if self.target_union_ratio[0] <= 0.0 or self.target_union_ratio[1] >= 1.0:
+            raise ValueError("target_union_ratio must leave both target and context cells")
+        self._configuration = {
+            "variant": "patch_2d_random_spatial_segment",
+            "raw_num_frames": self.layout.raw_num_frames,
+            "token_num_frames": self.layout.token_num_frames,
+            "temporal_patch_size": self.layout.temporal_patch_size,
+            "raw_num_joints": self.layout.raw_num_joints,
+            "token_num_joints": self.layout.token_num_joints,
+            "spatial_grouping": self.spatial_grouping,
+            "spatial_pooling": self.spatial_pooling,
+            "pred_frame_mask_ratio": self.pred_frame_mask_ratio,
+            "pred_spatial_mask_count": self.pred_spatial_mask_count,
+            "target_union_ratio": self.target_union_ratio,
+            "npred": self.npred,
+            "max_sampling_attempts": self.max_sampling_attempts,
+        }
+
+    def _target(
+        self,
+        valid_length: int,
+        frame_count: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        start = int(
+            torch.randint(
+                valid_length - frame_count + 1, (), generator=generator
+            ).item()
+        )
+        spatial = torch.randperm(
+            self.layout.token_num_joints, generator=generator
+        )[: self.pred_spatial_mask_count]
+        target = torch.zeros(
+            self.layout.token_num_frames,
+            self.layout.token_num_joints,
+            dtype=torch.bool,
+        )
+        target[start : start + frame_count, spatial] = True
+        return target
+
+    def __call__(self, batch):
+        collated_batch = torch.utils.data.default_collate(batch)
+        generator = torch.Generator().manual_seed(self.step())
+        raw_lengths = torch.tensor(
+            [
+                int(sample[2]) if len(sample) >= 3 else self.layout.raw_num_frames
+                for sample in batch
+            ],
+            dtype=torch.long,
+        )
+        token_lengths = self.layout.valid_token_lengths(raw_lengths)
+        if (token_lengths < 1).any():
+            raise ValueError(
+                "Every sample must contain at least one complete temporal patch"
+            )
+        valid_lengths = _valid_lengths(
+            [(None, None, int(length)) for length in token_lengths.tolist()],
+            self.layout.token_num_frames,
+        )
+        shortest = min(valid_lengths)
+        frame_count = _block_length(
+            shortest, _sample_ratio(generator, self.pred_frame_mask_ratio)
+        )
+        target_count = frame_count * self.pred_spatial_mask_count
+        if target_count <= 0:
+            raise ValueError("Target masks cannot be empty")
+
+        contexts_by_sample: list[torch.Tensor] = []
+        targets_by_sample: list[list[torch.Tensor]] = []
+        lower, upper = self.target_union_ratio
+        for valid_length in valid_lengths:
+            valid_cells = valid_length * self.layout.token_num_joints
+            sampled_targets = None
+            target_union = None
+            for _attempt in range(self.max_sampling_attempts):
+                candidates = [
+                    self._target(valid_length, frame_count, generator)
+                    for _ in range(self.npred)
+                ]
+                union = torch.stack(candidates).any(dim=0)
+                union_ratio = float(union.sum()) / float(valid_cells)
+                if lower <= union_ratio <= upper:
+                    sampled_targets = candidates
+                    target_union = union
+                    break
+            if sampled_targets is None or target_union is None:
+                raise ValueError(
+                    "Could not sample random spatial target masks within "
+                    f"target_union_ratio={self.target_union_ratio}; adjust frame "
+                    "ratio, spatial count, or union bounds"
+                )
+            valid = (
+                torch.arange(self.layout.token_num_frames)[:, None] < valid_length
+            ).expand(-1, self.layout.token_num_joints)
+            context = valid & ~target_union
+            if not context.any():
+                raise ValueError("Target union leaves no context cells")
+            contexts_by_sample.append(context)
+            targets_by_sample.append(sampled_targets)
+
+        contexts = [torch.stack(contexts_by_sample)]
+        targets = [
+            torch.stack([sample[index] for sample in targets_by_sample])
+            for index in range(self.npred)
+        ]
+        return collated_batch, contexts, targets
+
+
 __all__ = [
     "COARSE7_GRAPH_EDGES",
     "COARSE7_GROUP_NAMES",
     "PatchBodyRegionSegmentMaskCollator2D",
     "PatchRandomBodySegmentMaskCollator2D",
+    "PatchRandomSpatialSegmentMaskCollator2D",
 ]

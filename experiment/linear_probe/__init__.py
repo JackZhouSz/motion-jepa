@@ -24,6 +24,7 @@ from .features import (
     resolve_device,
     resolve_pretraining_stats,
 )
+from .linear import RawMotionLinearClassifier
 from .transformer import MotionTransformerClassifier
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "SPATIAL_FLATTEN_POOLING",
     "Metrics",
     "MotionCNNClassifier",
+    "RawMotionLinearClassifier",
     "MotionTransformerClassifier",
     "StyleLabelIndex",
     "StyleMotionDataset",

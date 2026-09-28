@@ -16,7 +16,7 @@ from train import main as train_main
 class Patch2DTrainingSmokeTest(unittest.TestCase):
     @staticmethod
     def _config(dataset: Path, output: Path, grouping: str) -> dict:
-        token_joints = 11 if grouping == "fine11" else 7
+        token_joints = 12 if grouping == "fine11" else 8
         return {
             "data": {
                 "batch_size": 2,
@@ -118,13 +118,14 @@ class Patch2DTrainingSmokeTest(unittest.TestCase):
             )
             config = self._config(dataset, root / "output-body-region", "coarse7")
             config["mask"] = {
-                "strategy": "body_region_segment",
-                "allow_overlap": False,
+                "strategy": "random_spatial_segment",
                 "num_enc_masks": 1,
-                "num_pred_masks": 1,
-                "num_regions": 2,
+                "num_pred_masks": 4,
                 "pred_frame_mask_ratio": [0.5, 0.5],
-                "graph_mask_ratio": [2.0 / 7.0, 3.0 / 7.0],
+                "pred_spatial_mask_count": 4,
+                "target_union_ratio": [0.5, 0.875],
+                "allow_target_overlap": True,
+                "allow_context_target_overlap": False,
             }
             result = train_main(config, device="cpu")
             self.assertEqual(result["global_step"], 1)
@@ -143,12 +144,14 @@ class Patch2DTrainingSmokeTest(unittest.TestCase):
             )
             config = self._config(dataset, root / "output-random-body", "coarse7")
             config["mask"] = {
-                "strategy": "random_body_segment",
-                "allow_overlap": False,
+                "strategy": "random_spatial_segment",
                 "num_enc_masks": 1,
                 "num_pred_masks": 4,
-                "pred_frame_mask_ratio": [0.15, 0.25],
-                "body_mask_ratio": [1.0 / 7.0, 3.0 / 7.0],
+                "pred_frame_mask_ratio": [0.5, 0.5],
+                "pred_spatial_mask_count": 4,
+                "target_union_ratio": [0.5, 0.875],
+                "allow_target_overlap": True,
+                "allow_context_target_overlap": False,
             }
             result = train_main(config, device="cpu")
             self.assertEqual(result["global_step"], 1)

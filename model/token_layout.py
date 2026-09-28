@@ -18,6 +18,10 @@ class TokenLayout:
     temporal_patch_size: int = 1
     raw_num_joints: int | None = None
     token_num_joints: int | None = None
+    trajectory_token_index: int | None = None
+    body_token_offset: int | None = None
+    spatial_token_names: tuple[str, ...] | None = None
+    trajectory_fields: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"1d", "2d"}:
@@ -42,6 +46,26 @@ class TokenLayout:
             int(self.raw_num_joints or 0), int(self.token_num_joints or 0)
         ) <= 0:
             raise ValueError("2D token layouts require positive joint dimensions")
+        if self.spatial_token_names is not None:
+            if self.kind != "2d":
+                raise ValueError("Only 2D token layouts define spatial token names")
+            if len(self.spatial_token_names) != int(self.token_num_joints):
+                raise ValueError(
+                    "spatial_token_names must match token_num_joints: "
+                    f"{len(self.spatial_token_names)} != {self.token_num_joints}"
+                )
+        trajectory_metadata = (
+            self.trajectory_token_index,
+            self.body_token_offset,
+            self.trajectory_fields,
+        )
+        if any(value is not None for value in trajectory_metadata):
+            if any(value is None for value in trajectory_metadata):
+                raise ValueError("Trajectory token metadata must be configured together")
+            if not 0 <= int(self.trajectory_token_index) < int(self.token_num_joints or 0):
+                raise ValueError("trajectory_token_index is outside the spatial token grid")
+            if not 0 <= int(self.body_token_offset) <= int(self.token_num_joints or 0):
+                raise ValueError("body_token_offset is outside the spatial token grid")
 
     def valid_token_lengths(self, raw_lengths: torch.Tensor) -> torch.Tensor:
         lengths = torch.as_tensor(raw_lengths)
@@ -62,7 +86,7 @@ class TokenLayout:
             len(active), self.token_num_frames, self.temporal_patch_size
         ).all(dim=-1)
 
-    def signature(self) -> dict[str, int | str | bool | None]:
+    def signature(self) -> dict[str, int | str | bool | list[str] | None]:
         return {
             "kind": self.kind,
             "patchified": self.patchified,
@@ -71,6 +95,16 @@ class TokenLayout:
             "temporal_patch_size": self.temporal_patch_size,
             "raw_num_joints": self.raw_num_joints,
             "token_num_joints": self.token_num_joints,
+            "trajectory_token_index": self.trajectory_token_index,
+            "body_token_offset": self.body_token_offset,
+            "spatial_token_names": (
+                list(self.spatial_token_names)
+                if self.spatial_token_names is not None else None
+            ),
+            "trajectory_fields": (
+                list(self.trajectory_fields)
+                if self.trajectory_fields is not None else None
+            ),
         }
 
 

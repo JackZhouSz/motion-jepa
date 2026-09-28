@@ -19,10 +19,6 @@ run_visualization() {
         --valid-length "${VALID_LENGTH}"
 }
 
-run_visualization "configs/mjepa_1d_base.yaml" "raw-1d"
-run_visualization "configs/mjepa_patch_1d_base.yaml" "patch-1d-p3"
-run_visualization "configs/mjepa_2d_base.yaml" "raw-2d"
-run_visualization "configs/mjepa_patch_2d_base_fine11.yaml" "patch-2d-p3-fine11"
-run_visualization "configs/mjepa_patch_2d_base_coarse7.yaml" "patch-2d-p3-coarse7"
+run_visualization "configs/mjepa_patch_2d_tiny_coarse7.yaml" "patch-2d-trajectory-coarse7"
 
 echo "Saved all mask visualizations under ${OUTPUT_DIR}"

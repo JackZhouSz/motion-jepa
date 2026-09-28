@@ -1,4 +1,4 @@
-"""Independent viser dataset browser for NPY-backed Motion-JEPA motions."""
+"""Independent viser dataset browser for NPY-backed MotionJEPA motions."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class MotionEntry:
 
 def discover_entries(root: Path, split: str, limit: int) -> list[MotionEntry]:
     if not root.is_dir():
-        raise FileNotFoundError(f"Motion-JEPA NPY dataset root does not exist: {root}")
+        raise FileNotFoundError(f"MotionJEPA NPY dataset root does not exist: {root}")
     records: dict[str, dict[str, Any]] = {}
     index_records: list[dict[str, Any]] = []
     index_path = root / "index.json"
@@ -78,14 +78,14 @@ def discover_entries(root: Path, split: str, limit: int) -> list[MotionEntry]:
     if limit > 0:
         entries = entries[:limit]
     if not entries:
-        raise FileNotFoundError(f"No Motion-JEPA samples found under {root}")
+        raise FileNotFoundError(f"No MotionJEPA samples found under {root}")
     return entries
 
 
 def read_dataset_fps(root: Path) -> int:
     path = root / "meta.json"
     if not path.is_file():
-        raise FileNotFoundError(f"No Motion-JEPA NPY metadata found: {path}")
+        raise FileNotFoundError(f"No MotionJEPA NPY metadata found: {path}")
     metadata = json.loads(path.read_text(encoding="utf-8"))
     if metadata.get("motion_storage") != "npy_float32_v1":
         raise ValueError(f"Dataset is not NPY-backed: {path}")
@@ -154,16 +154,13 @@ class MotionRenderer:
                 self.skeleton.name_to_index["RightToeEnd"],
             ]
         )
-        first_vertices = self.skin.pose(motion["global_rot_mats"][0], motion["posed_joints"][0])
-        self.mesh = client.scene.add_mesh_simple(
-            "/motion_jepa/mesh",
-            vertices=first_vertices,
-            faces=self.skin.faces,
-            color=(152, 189, 255),
-            opacity=0.9,
-            side="double",
-            visible=show_mesh,
-        )
+        self.frame = 0
+        self._mesh_visible = bool(show_mesh)
+        self._mesh_vertices: np.ndarray | None = None
+        self._mesh_opacity = 0.9
+        self.mesh = None
+        if self._mesh_visible:
+            self._create_mesh(self._ensure_mesh_cache()[0])
         first_joints = motion["posed_joints"][0].detach().cpu().numpy()
         self.shaded_skeleton = ShadedSkeletonRenderer(
             client.scene,
@@ -174,7 +171,6 @@ class MotionRenderer:
         # Retain these public handle attributes for callers of MotionRenderer.
         self.joints = self.shaded_skeleton.joints
         self.bones = self.shaded_skeleton.bones
-        self.frame = 0
 
     @property
     def length(self) -> int:
@@ -185,6 +181,49 @@ class MotionRenderer:
             return None
         contacts = self.motion["foot_contacts"][frame].detach().cpu().numpy().astype(bool)
         return self.foot_indices[contacts]
+
+    def _ensure_mesh_cache(self) -> np.ndarray:
+        if self._mesh_vertices is None:
+            rotations = self.motion["global_rot_mats"]
+            positions = self.motion["posed_joints"]
+            with torch.inference_mode():
+                first = self.skin.pose(rotations[0], positions[0])
+                self._mesh_vertices = np.empty(
+                    (self.length, *first.shape),
+                    dtype=np.float32,
+                )
+                self._mesh_vertices[0] = first
+                for frame in range(1, self.length):
+                    self._mesh_vertices[frame] = self.skin.pose(
+                        rotations[frame], positions[frame]
+                    )
+        return self._mesh_vertices
+
+    def _create_mesh(self, vertices: np.ndarray) -> None:
+        self.mesh = self.client.scene.add_mesh_simple(
+            "/motion_jepa/mesh",
+            vertices=vertices,
+            faces=self.skin.faces,
+            color=(152, 189, 255),
+            opacity=self._mesh_opacity,
+            side="double",
+            visible=True,
+        )
+
+    def set_mesh_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if visible and self.mesh is None:
+            self._create_mesh(self._ensure_mesh_cache()[self.frame])
+        elif visible and not self._mesh_visible:
+            self.mesh.vertices = self._ensure_mesh_cache()[self.frame]
+        self._mesh_visible = visible
+        if self.mesh is not None:
+            self.mesh.visible = visible
+
+    def set_mesh_opacity(self, opacity: float) -> None:
+        self._mesh_opacity = float(opacity)
+        if self.mesh is not None:
+            self.mesh.opacity = self._mesh_opacity
 
     def _skeleton_geometry(self, frame: int, show_contacts: bool):
         """Compatibility helper returning joint positions and colors."""
@@ -201,9 +240,10 @@ class MotionRenderer:
 
     def set_frame(self, frame: int, show_contacts: bool) -> None:
         self.frame = int(np.clip(frame, 0, self.length - 1))
-        rotations = self.motion["global_rot_mats"][self.frame]
         positions = self.motion["posed_joints"][self.frame]
-        self.mesh.vertices = self.skin.pose(rotations, positions)
+        if self._mesh_visible:
+            assert self.mesh is not None
+            self.mesh.vertices = self._ensure_mesh_cache()[self.frame]
         points = positions.detach().cpu().numpy()
         self.shaded_skeleton.update(
             points,
@@ -211,7 +251,8 @@ class MotionRenderer:
         )
 
     def clear(self) -> None:
-        self.mesh.remove()
+        if self.mesh is not None:
+            self.mesh.remove()
         self.shaded_skeleton.remove()
 
 
@@ -244,7 +285,7 @@ class MotionJEPADatasetViewer:
         try:
             import viser
         except ModuleNotFoundError as error:
-            raise ModuleNotFoundError("Motion-JEPA visualization requires `pip install viser trimesh`.") from error
+            raise ModuleNotFoundError("MotionJEPA visualization requires `pip install viser trimesh`.") from error
         self.viser = viser
         self.root = root
         self.fps = read_dataset_fps(root)
@@ -264,7 +305,7 @@ class MotionJEPADatasetViewer:
         self.server = viser.ViserServer(
             host=host,
             port=port,
-            label="Motion-JEPA Dataset Viewer",
+            label="MotionJEPA Dataset Viewer",
             enable_camera_keyboard_controls=False,
         )
         self.server.scene.world_axes.visible = False
@@ -375,12 +416,12 @@ class MotionJEPADatasetViewer:
         @mesh.on_update
         def _(_event):
             if session.renderer:
-                session.renderer.mesh.visible = bool(mesh.value)
+                session.renderer.set_mesh_visible(bool(mesh.value))
 
         @opacity.on_update
         def _(_event):
             if session.renderer:
-                session.renderer.mesh.opacity = float(opacity.value)
+                session.renderer.set_mesh_opacity(float(opacity.value))
 
         @skeleton.on_update
         def _(_event):

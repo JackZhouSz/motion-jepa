@@ -215,7 +215,7 @@ class PatchModel2DTest(unittest.TestCase):
         valid = torch.arange(8).unsqueeze(0) < torch.tensor([[8], [5]])
         changed = self.motion.clone()
         changed[1, 5:] = torch.randn_like(changed[1, 5:]) * 1000
-        for grouping, groups in (("fine11", 11), ("coarse7", 7)):
+        for grouping, groups in (("fine11", 12), ("coarse7", 8)):
             encoder = self._encoder(grouping).eval()
             with torch.no_grad():
                 output = encoder(self.motion, self.fps, valid_frames=valid)
@@ -259,10 +259,10 @@ class PatchModel2DTest(unittest.TestCase):
         ) * 1000
         with torch.no_grad():
             spatial_output = encoder.patch_embed(spatial_change)
-        target_group = [name for name, _ in encoder.groups].index("left_upper_arm")
-        visible = [index for index in range(11) if index != target_group]
+        target_group = 1 + [name for name, _ in encoder.groups].index("left_upper_arm")
+        visible = [index for index in range(12) if index != target_group]
         torch.testing.assert_close(original[:, 0, visible], spatial_output[:, 0, visible])
-        context_mask = torch.ones((2, 2, 11), dtype=torch.bool)
+        context_mask = torch.ones((2, 2, 12), dtype=torch.bool)
         context_mask[:, 0, target_group] = False
         with torch.no_grad():
             context_original = encoder(self.motion, self.fps, [context_mask])
@@ -274,7 +274,7 @@ class PatchModel2DTest(unittest.TestCase):
         _, masks_enc, masks_pred = PatchMaskCollator2D(
             raw_num_frames=8,
             raw_num_joints=30,
-            token_num_joints=7,
+            token_num_joints=8,
             temporal_patch_size=3,
             spatial_grouping="coarse7",
             enc_frame_mask_ratio=(1.0, 1.0),
@@ -307,9 +307,41 @@ class PatchModel2DTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
         self.assertEqual(encoder.patch_embed.temporal_conv.groups, 30)
-        self.assertEqual(tuple(encoder.patch_embed.joint_feature_indices.shape), (30, 14))
+        self.assertEqual(tuple(encoder.patch_embed.joint_feature_indices.shape), (30, 13))
         self.assertIsNotNone(encoder.patch_embed.temporal_conv.weight.grad)
+        self.assertIsNotNone(encoder.patch_embed.trajectory_conv.weight.grad)
         self.assertIsNotNone(encoder.patch_embed.graph_projection.weight.grad)
+
+    def test_trajectory_and_body_routing_are_disjoint_and_semantic(self):
+        encoder = self._encoder("coarse7")
+        stem = encoder.patch_embed
+        trajectory = set(stem.trajectory_feature_indices.tolist())
+        body = {
+            index
+            for row, width in zip(stem.joint_feature_indices.tolist(), stem.body_input_dims)
+            for index in row[:width]
+        }
+        self.assertFalse(trajectory & body)
+        self.assertEqual(trajectory | body, set(range(366)))
+        self.assertEqual(trajectory, {0, 2, 3, 4})
+        self.assertIn(1, body)
+
+        with torch.no_grad():
+            original = stem(self.motion)
+            trajectory_changed = self.motion.clone()
+            trajectory_changed[:, :3, [0, 2, 3, 4]] += 100.0
+            trajectory_output = stem(trajectory_changed)
+            torch.testing.assert_close(original[:, 0, 1:], trajectory_output[:, 0, 1:])
+
+            pelvis_changed = self.motion.clone()
+            pelvis_changed[:, :3, [1, *range(92, 98), *range(272, 275)]] += 100.0
+            pelvis_output = stem(pelvis_changed)
+            torch.testing.assert_close(original[:, 0, 0], pelvis_output[:, 0, 0])
+            torch.testing.assert_close(original[:, 0, 2:], pelvis_output[:, 0, 2:])
+
+        parameter_names = dict(encoder.named_parameters())
+        self.assertFalse(any("type_embed" in name for name in parameter_names))
+        self.assertEqual(encoder.positions.group.shape[2], 8)
 
     def test_frozen_mean_and_temporal_token_probe_support(self):
         encoder = mot_patch_tiny_2d(
@@ -342,10 +374,10 @@ class PatchModel2DTest(unittest.TestCase):
             loaded, _, info = load_frozen_encoder(
                 path, "target_encoder", torch.device("cpu")
             )
-        self.assertEqual(info["token_num_joints"], 7)
+        self.assertEqual(info["token_num_joints"], 8)
         self.assertEqual(info["spatial_grouping"], "coarse7")
         pooled = pool_encoder_output(
-            torch.ones(1, 2, 7, 4), torch.tensor([5]), loaded.token_layout
+            torch.ones(1, 2, 8, 4), torch.tensor([5]), loaded.token_layout
         )
         torch.testing.assert_close(pooled, torch.ones(1, 4))
         sample = (self.motion[0], torch.tensor(60), torch.tensor(5), torch.tensor(0), "x")

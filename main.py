@@ -18,7 +18,12 @@ from utils.distributed import cleanup_distributed
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train Motion-JEPA")
-    parser.add_argument("--config", default="configs/mjepa_1d.yaml", help="YAML config")
+    parser.add_argument(
+        "--config", "--fname",
+        dest="config",
+        default="configs/mjepa_patch_2d_tiny_coarse7.yaml",
+        help="YAML config",
+    )
     parser.add_argument(
         "--devices",
         nargs="+",
@@ -78,16 +83,19 @@ def _is_torchrun() -> bool:
 
 
 def launch(args: argparse.Namespace):
+    config = getattr(args, "config", getattr(args, "fname", None))
+    if config is None:
+        raise ValueError("A training config path is required")
     if _is_torchrun():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
-        return _run(args.config, device)
+        return _run(config, device)
     devices = list(args.devices[:1] if args.debug else args.devices)
     if len(devices) == 1:
-        return _spawn_worker(0, args.config, devices, args.master_port)
+        return _spawn_worker(0, config, devices, args.master_port)
     mp.spawn(
         _spawn_worker,
-        args=(args.config, devices, args.master_port),
+        args=(config, devices, args.master_port),
         nprocs=len(devices),
         join=True,
     )

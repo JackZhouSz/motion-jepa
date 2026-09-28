@@ -70,18 +70,22 @@ class PatchMaskCollator2D(MaskCollator2D):
         spatial_pooling: str = "graph_mean",
         **kwargs,
     ) -> None:
-        expected_groups = {"joint30": 30, "fine11": 11, "coarse7": 7}
-        if spatial_grouping not in expected_groups:
+        body_groups = {"joint30": 30, "fine11": 11, "coarse7": 7}
+        if spatial_grouping not in body_groups:
             raise ValueError(
                 f"Unknown spatial_grouping {spatial_grouping!r}; "
-                f"choose one of: {', '.join(sorted(expected_groups))}"
+                f"choose one of: {', '.join(sorted(body_groups))}"
             )
         if int(raw_num_joints) != 30:
             raise ValueError("PatchMaskCollator2D requires SOMA30")
-        if int(token_num_joints) != expected_groups[spatial_grouping]:
+        accepted_tokens = {
+            body_groups[spatial_grouping],
+            body_groups[spatial_grouping] + 1,
+        }
+        if int(token_num_joints) not in accepted_tokens:
             raise ValueError(
                 f"spatial_grouping={spatial_grouping!r} requires "
-                f"token_num_joints={expected_groups[spatial_grouping]}"
+                f"token_num_joints in {sorted(accepted_tokens)}"
             )
         if spatial_pooling != "graph_mean":
             raise ValueError("PatchMaskCollator2D supports only graph_mean pooling")

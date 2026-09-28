@@ -72,6 +72,7 @@ class CheckpointTest(unittest.TestCase):
                 linear_probe_latest={"pretrain_epoch": 1, "test": {"top1_accuracy": 0.7}},
                 best_probe_val_top1=0.8,
                 best_probe_epoch=1,
+                online_metrics_latest={"pretrain_epoch": 1, "rankme": 3.0},
             )
             expected_random = (random.random(), np.random.rand(), torch.rand(()))
             expected_lr = lr.step()
@@ -85,6 +86,7 @@ class CheckpointTest(unittest.TestCase):
             lr.step()
             collator(batch)
             linear_probe_state = {}
+            online_metrics_state = {}
             next_epoch, global_step = _load_checkpoint(
                 path,
                 device=torch.device("cpu"),
@@ -100,11 +102,13 @@ class CheckpointTest(unittest.TestCase):
                 rank=0,
                 world_size=1,
                 linear_probe_state=linear_probe_state,
+                online_metrics_state=online_metrics_state,
             )
             self.assertEqual((next_epoch, global_step), (1, 2))
             self.assertEqual(linear_probe_state["best_val_top1"], 0.8)
             self.assertEqual(linear_probe_state["best_epoch"], 1)
             self.assertEqual(linear_probe_state["latest"]["pretrain_epoch"], 1)
+            self.assertEqual(online_metrics_state["latest"]["rankme"], 3.0)
             for name, value in encoder.state_dict().items():
                 torch.testing.assert_close(value, saved_encoder[name])
             actual_random = (random.random(), np.random.rand(), torch.rand(()))

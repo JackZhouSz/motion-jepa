@@ -12,7 +12,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-from dataset import preprocess_dataset as preprocessing
+from dataset import preprocess_bones_seed as preprocessing
 
 
 class MotionFPSTest(unittest.TestCase):

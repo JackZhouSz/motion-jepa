@@ -2,15 +2,27 @@
 *.swo
 __pycache__
 .ipynb_checkpoints/
+third_party/motion_correction/build/
+third_party/motion_correction/*.egg-info/
+third_party/motion_correction/python/*.egg-info/
+third_party/motion_correction/python/motion_correction/*.so
 
 dataset/*
 !dataset/*.py
+!dataset/AMASS_TO_SOMA.md
 !dataset/Frame_Cuts.csv
+!dataset/babel-60-and-120/
+dataset/babel-60-and-120/*
+!dataset/babel-60-and-120/*.py
+!dataset/babel-60-and-120/*.sh
+!dataset/babel-60-and-120/action_label_2_idx.json
 dataset-bvh/
 output/
 /output
-findings/**/runs/
+# findings/**/runs/
+findings/
 
 .vscode/
 ijepa/
 .codex/
+configs/_depr*

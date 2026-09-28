@@ -61,6 +61,39 @@ def require_validation_dataset(dataset_root: Path) -> None:
         )
 
 
+def has_validation_dataset(dataset_root: Path) -> bool:
+    """Return whether the probe dataset has a usable validation split."""
+    meta_path = dataset_root / "meta.json"
+    if meta_path.is_file():
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if metadata.get("validation_enabled") is False:
+            return False
+    val_manifest = dataset_root / "val.txt"
+    return val_manifest.is_file() and bool(
+        val_manifest.read_text(encoding="utf-8").strip()
+    )
+
+
+def resolve_checkpoints(
+    output_root: Path, checkpoint_values: list[Path] | None
+) -> list[tuple[str, Path]]:
+    """Resolve explicit immutable checkpoints or retain legacy latest discovery."""
+    if not checkpoint_values:
+        return discover_latest_checkpoints(output_root)
+    resolved: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for value in checkpoint_values:
+        checkpoint = Path(value).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+        if checkpoint in seen:
+            continue
+        seen.add(checkpoint)
+        label = f"{checkpoint.parent.name}--{checkpoint.name.removesuffix('.pth.tar')}"
+        resolved.append((label, checkpoint))
+    return resolved
+
+
 def discover_latest_checkpoints(output_root: Path) -> list[tuple[str, Path]]:
     """Find one latest checkpoint in each direct child training directory."""
     if not output_root.is_dir():
@@ -134,6 +167,7 @@ def load_or_extract_adaptive(
     num_workers: int,
     use_bfloat16: bool,
     recompute: bool,
+    pooling: str = features.GLOBAL_MEAN_POOLING,
 ) -> tuple[dict[str, Any], int]:
     """Reuse a valid cache or reduce feature batch size after CUDA OOM."""
     if cache_path.is_file() and not recompute:
@@ -158,6 +192,7 @@ def load_or_extract_adaptive(
                 num_workers=num_workers,
                 use_bfloat16=use_bfloat16,
                 recompute=True,
+                pooling=pooling,
             )
             return payload, batch_size
         except BaseException as error:
@@ -179,6 +214,8 @@ def prepare_checkpoint_features(
     feature_batch_size: int,
     num_workers: int,
     recompute_features: bool,
+    pooling: str = features.GLOBAL_MEAN_POOLING,
+    cache_root: Path | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, Any]]:
     encoder, config, model_info = features.load_frozen_encoder(
         checkpoint_path, "target_encoder", device
@@ -203,7 +240,11 @@ def prepare_checkpoint_features(
         ]
         raise ValueError(f"Training split is missing style classes: {missing}")
 
-    cache_root = checkpoint_path.parent / "linear-probe" / "features"
+    cache_root = (
+        checkpoint_path.parent / "linear-probe" / "features"
+        if cache_root is None
+        else cache_root
+    )
     cache_root.mkdir(parents=True, exist_ok=True)
     caches: dict[str, dict[str, Any]] = {}
     used_batch_sizes: dict[str, int] = {}
@@ -217,19 +258,30 @@ def prepare_checkpoint_features(
             stats_root=stats_root,
             model_info=model_info,
             class_names=class_names,
+            pooling=pooling,
         )
-        caches[split], used = load_or_extract_adaptive(
-            split=split,
-            cache_path=cache_root / f"{split}.pt",
-            metadata=metadata,
-            dataset=datasets[split],
-            encoder=encoder,
-            device=device,
-            initial_batch_size=next_batch_size,
-            num_workers=num_workers,
-            use_bfloat16=model_info["use_bfloat16"],
-            recompute=recompute_features,
-        )
+        if len(datasets[split]) == 0:
+            caches[split] = {
+                "metadata": metadata,
+                "features": torch.empty((0, int(metadata["feature_dim"]))),
+                "labels": torch.empty((0,), dtype=torch.long),
+                "sample_ids": [],
+            }
+            used = next_batch_size
+        else:
+            caches[split], used = load_or_extract_adaptive(
+                split=split,
+                cache_path=cache_root / f"{split}.pt",
+                metadata=metadata,
+                dataset=datasets[split],
+                encoder=encoder,
+                device=device,
+                initial_batch_size=next_batch_size,
+                num_workers=num_workers,
+                use_bfloat16=model_info["use_bfloat16"],
+                recompute=recompute_features,
+                pooling=pooling,
+            )
         used_batch_sizes[split] = used
         next_batch_size = min(next_batch_size, used)
 
@@ -238,7 +290,8 @@ def prepare_checkpoint_features(
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": features._sha256_file(checkpoint_path),
         "model_name": model_info["model_name"],
-        "feature_dim": model_info["feature_dim"],
+        "feature_dim": int(caches["train"]["features"].shape[1]),
+        "pooling": pooling,
         "dataset_root": str(dataset_root),
         "dataset_index_sha256": features._sha256_file(dataset_root / "index.json"),
         "stats_root": str(stats_root),
@@ -267,6 +320,7 @@ def _run_signature(
         "batch_size": args.batch_size,
         "momentum": args.momentum,
         "weight_decay": args.weight_decay,
+        "pooling": checkpoint_info.get("pooling", features.GLOBAL_MEAN_POOLING),
     }
 
 
@@ -286,8 +340,9 @@ def run_one_probe(
     if summary_path.is_file() and not args.overwrite_runs:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if summary.get("status") == "complete" and summary.get("signature") == signature:
+            head_filename = summary.get("head_filename", "linear-probe-best.pth.tar")
             if (run_root / "metrics.csv").is_file() and (
-                run_root / "linear-probe-best.pth.tar"
+                run_root / head_filename
             ).is_file():
                 return summary
 
@@ -335,7 +390,10 @@ def _result_row(summary: dict[str, Any]) -> dict[str, Any]:
     for split in ("best_val", "test"):
         prefix = "val" if split == "best_val" else "test"
         for metric in METRIC_NAMES:
-            row[f"{prefix}_{metric}"] = summary[split][metric]
+            values = summary.get(split)
+            row[f"{prefix}_{metric}"] = (
+                float("nan") if values is None else values[metric]
+            )
     return row
 
 
@@ -450,15 +508,18 @@ def create_plots(
     aggregates: list[dict[str, Any]],
     run_names: list[str],
     lrs: list[float],
+    *,
+    validation_used: bool = True,
 ) -> None:
-    _plot_heatmap(
-        aggregates,
-        run_names,
-        lrs,
-        "val_top1_accuracy_mean",
-        findings_root / "validation-top1-heatmap.png",
-        "Validation top-1 by checkpoint and learning rate",
-    )
+    if validation_used:
+        _plot_heatmap(
+            aggregates,
+            run_names,
+            lrs,
+            "val_top1_accuracy_mean",
+            findings_root / "validation-top1-heatmap.png",
+            "Validation top-1 by checkpoint and learning rate",
+        )
     _plot_heatmap(
         aggregates,
         run_names,
@@ -476,7 +537,10 @@ def create_plots(
         )
         figure, axis = plt.subplots(figsize=(7, 4.5))
         multiple_seeds = any(int(row["num_seeds"]) > 1 for row in group)
-        for split, color in (("val", "tab:blue"), ("test", "tab:orange")):
+        splits = [("test", "tab:orange")]
+        if validation_used:
+            splits.insert(0, ("val", "tab:blue"))
+        for split, color in splits:
             x_values = [float(row["lr"]) for row in group]
             y_values = [
                 float(row[f"{split}_top1_accuracy_mean"]) * 100 for row in group
@@ -527,6 +591,8 @@ def write_readme(
     lrs: list[float],
     seeds: list[int],
     args: argparse.Namespace,
+    *,
+    validation_used: bool = True,
 ) -> None:
     lookup = {(row["run_name"], float(row["lr"])): row for row in aggregates}
     multiple_seeds = len(seeds) > 1
@@ -535,19 +601,21 @@ def write_readme(
         "",
         "## Settings",
         "",
-        f"- Checkpoints: {len(checkpoint_infos)} latest checkpoints from direct children of `output/`",
+        f"- Checkpoints: {len(checkpoint_infos)}",
         f"- Dataset: `{args.dataset_root}`",
         f"- Learning rates: {', '.join(f'`{lr:g}`' for lr in lrs)}",
         f"- Seeds: {', '.join(map(str, seeds))}",
         f"- Epochs: {args.epochs}",
         f"- Optimizer: SGD, momentum {args.momentum}, weight decay {args.weight_decay}",
         "- Schedule: cosine decay; loss: ordinary cross entropy",
-        "- Pooling: frozen EMA target encoder valid-token global mean",
-        "- Test results are reported for every LR; downstream comparisons select LR by validation top-1",
+        f"- Pooling: `{getattr(args, 'pooling', features.GLOBAL_MEAN_POOLING)}`",
+        (
+            "- Downstream comparisons select LR by validation top-1"
+            if validation_used
+            else "- No validation split: FW test results are diagnostic only and must not be used to select LR"
+        ),
         "",
         "## Overall comparison",
-        "",
-        "![Validation top-1 heatmap](validation-top1-heatmap.png)",
         "",
         "![Test top-1 heatmap](test-top1-heatmap.png)",
         "",
@@ -562,6 +630,12 @@ def write_readme(
         "| Run | Encoder | Feature dim | SHA256 |",
         "|---|---:|---:|---|",
     ]
+    if validation_used:
+        insertion = lines.index("![Test top-1 heatmap](test-top1-heatmap.png)")
+        lines[insertion:insertion] = [
+            "![Validation top-1 heatmap](validation-top1-heatmap.png)",
+            "",
+        ]
     for info in checkpoint_infos:
         lines.append(
             f"| `{info['run_name']}` | `{info['model_name']}` | "
@@ -576,39 +650,55 @@ def write_readme(
                 "",
                 f"![{run_name} LR curve](plots/{run_name}.png)",
                 "",
-                "| LR | Val top-1 | Val macro | Val top-5 | Test top-1 | Test macro | Test top-5 |",
-                "|---:|---:|---:|---:|---:|---:|---:|",
+                (
+                    "| LR | Val top-1 | Val macro | Val top-5 | Test top-1 | Test macro | Test top-5 |"
+                    if validation_used
+                    else "| LR | Test top-1 | Test macro | Test top-5 |"
+                ),
+                (
+                    "|---:|---:|---:|---:|---:|---:|---:|"
+                    if validation_used
+                    else "|---:|---:|---:|---:|"
+                ),
             ]
         )
         for lr in lrs:
             row = lookup[(run_name, lr)]
             values = []
-            for field in (
-                "val_top1_accuracy",
-                "val_macro_accuracy",
-                "val_top5_accuracy",
+            fields = [
                 "test_top1_accuracy",
                 "test_macro_accuracy",
                 "test_top5_accuracy",
-            ):
+            ]
+            if validation_used:
+                fields[0:0] = [
+                    "val_top1_accuracy",
+                    "val_macro_accuracy",
+                    "val_top5_accuracy",
+                ]
+            for field in fields:
                 values.append(
                     _format_aggregate_metric(
                         row, field, multiple_seeds=multiple_seeds
                     )
                 )
             lines.append(f"| {lr:g} | " + " | ".join(values) + " |")
-        val_values = [float(lookup[(run_name, lr)]["val_top1_accuracy_mean"]) for lr in lrs]
         test_values = [float(lookup[(run_name, lr)]["test_top1_accuracy_mean"]) for lr in lrs]
-        lines.extend(
-            [
-                "",
+        span = (
+            "Across the evaluated range, test top-1 spans "
+            f"{(max(test_values) - min(test_values)) * 100:.2f} percentage points."
+        )
+        if validation_used:
+            val_values = [
+                float(lookup[(run_name, lr)]["val_top1_accuracy_mean"]) for lr in lrs
+            ]
+            span = (
                 "Across the evaluated range, validation top-1 spans "
                 f"{(max(val_values) - min(val_values)) * 100:.2f} percentage points "
                 "and test top-1 spans "
-                f"{(max(test_values) - min(test_values)) * 100:.2f} percentage points.",
-                "",
-            ]
-        )
+                f"{(max(test_values) - min(test_values)) * 100:.2f} percentage points."
+            )
+        lines.extend(["", span, ""])
     lines.extend(
         [
             "## Raw artifacts",
@@ -631,6 +721,8 @@ def _write_reports(
     lrs: list[float],
     seeds: list[int],
     args: argparse.Namespace,
+    *,
+    validation_used: bool = True,
 ) -> None:
     checkpoint_infos = sorted(
         checkpoint_infos,
@@ -652,14 +744,33 @@ def _write_reports(
         list(epoch_rows[0]),
     )
     run_names = [info["run_name"] for info in checkpoint_infos]
-    create_plots(findings_root, aggregates, run_names, lrs)
-    write_readme(findings_root, checkpoint_infos, aggregates, lrs, seeds, args)
+    create_plots(
+        findings_root,
+        aggregates,
+        run_names,
+        lrs,
+        validation_used=validation_used,
+    )
+    write_readme(
+        findings_root,
+        checkpoint_infos,
+        aggregates,
+        lrs,
+        seeds,
+        args,
+        validation_used=validation_used,
+    )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     output_root = Path(args.output_root).expanduser().resolve()
     dataset_root = Path(args.dataset_root).expanduser().resolve()
-    require_validation_dataset(dataset_root)
+    validation_used = has_validation_dataset(dataset_root)
+    diagnostic_no_validation = bool(
+        getattr(args, "diagnostic_no_validation", False)
+    )
+    if not validation_used and not diagnostic_no_validation:
+        require_validation_dataset(dataset_root)
     findings_root = Path(args.findings_root).expanduser().resolve()
     findings_root.mkdir(parents=True, exist_ok=True)
     args.dataset_root = dataset_root
@@ -669,7 +780,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Learning rates must be finite and positive")
     if args.epochs <= 0 or args.batch_size <= 0 or args.feature_batch_size <= 0:
         raise ValueError("Epoch and batch sizes must be positive")
-    checkpoints = discover_latest_checkpoints(output_root)
+    checkpoints = resolve_checkpoints(
+        output_root, getattr(args, "checkpoints", None)
+    )
     device = features.resolve_device(args.device)
     checkpoint_infos: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
@@ -686,6 +799,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 feature_batch_size=args.feature_batch_size,
                 num_workers=args.num_workers,
                 recompute_features=args.recompute_features,
+                pooling=getattr(args, "pooling", features.GLOBAL_MEAN_POOLING),
+                cache_root=findings_root / "feature-cache" / run_name,
             )
             checkpoint_infos.append(info)
             for lr in lrs:
@@ -740,12 +855,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "momentum": args.momentum,
         "weight_decay": args.weight_decay,
         "device": str(device),
+        "pooling": getattr(args, "pooling", features.GLOBAL_MEAN_POOLING),
+        "validation_used": validation_used,
+        "diagnostic_no_validation": diagnostic_no_validation,
         "checkpoints": checkpoint_infos,
         "failures": failures,
     }
     _atomic_json(config, findings_root / "sweep-config.json")
     if summaries:
-        _write_reports(findings_root, summaries, checkpoint_infos, lrs, seeds, args)
+        _write_reports(
+            findings_root,
+            summaries,
+            checkpoint_infos,
+            lrs,
+            seeds,
+            args,
+            validation_used=validation_used,
+        )
     expected = len(checkpoints) * len(lrs) * len(seeds)
     result = {
         "num_checkpoints": len(checkpoints),
@@ -763,6 +889,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sweep linear probes over latest checkpoints")
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "output")
     parser.add_argument(
+        "--checkpoints",
+        nargs="+",
+        type=Path,
+        default=None,
+        help="Explicit immutable checkpoints; default discovers direct-child latest files",
+    )
+    parser.add_argument(
         "--dataset-root",
         type=Path,
         default=PROJECT_ROOT / "dataset/100style-soma77-processed",
@@ -777,6 +910,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--lrs", nargs="+", type=float, default=list(DEFAULT_LRS))
     parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
+    parser.add_argument(
+        "--pooling",
+        choices=(features.GLOBAL_MEAN_POOLING, features.SPATIAL_FLATTEN_POOLING),
+        default=features.GLOBAL_MEAN_POOLING,
+    )
+    parser.add_argument(
+        "--diagnostic-no-validation",
+        action="store_true",
+        help="Allow an LR sensitivity diagnostic without selecting LR on test metrics",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--feature-batch-size", type=int, default=256)

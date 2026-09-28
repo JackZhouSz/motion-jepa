@@ -90,6 +90,55 @@ class SweepUnitTest(unittest.TestCase):
 
 
 class SweepEndToEndTest(unittest.TestCase):
+    def test_explicit_checkpoint_diagnostic_without_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "output"
+            dataset_root = root / "dataset"
+            findings_root = root / "findings"
+            run_root = output_root / "run-a"
+            run_root.mkdir(parents=True)
+            _write_dataset(dataset_root, validation_enabled=False)
+            pretrain_stats = root / "pretrain-stats"
+            pretrain_stats.mkdir()
+            np.save(pretrain_stats / "mean.npy", np.zeros(6, dtype=np.float32))
+            np.save(pretrain_stats / "std.npy", np.ones(6, dtype=np.float32))
+            checkpoint = run_root / "motion-jepa-ep50.pth.tar"
+            _write_checkpoint(checkpoint, pretrain_stats)
+
+            args = argparse.Namespace(
+                output_root=output_root,
+                checkpoints=[checkpoint],
+                dataset_root=dataset_root,
+                findings_root=findings_root,
+                lrs=[0.1],
+                seeds=[42],
+                pooling="valid_token_mean",
+                diagnostic_no_validation=True,
+                epochs=2,
+                batch_size=2,
+                feature_batch_size=4,
+                num_workers=0,
+                momentum=0.9,
+                weight_decay=0.0,
+                device="cpu",
+                recompute_features=False,
+                overwrite_runs=False,
+            )
+            result = sweep.run(args)
+            self.assertEqual(result["num_completed"], 1)
+            self.assertTrue((findings_root / "test-top1-heatmap.png").is_file())
+            self.assertFalse(
+                (findings_root / "validation-top1-heatmap.png").exists()
+            )
+            with (findings_root / "sweep-results.csv").open() as file:
+                row = next(csv.DictReader(file))
+            self.assertEqual(row["val_top1_accuracy"], "nan")
+            final_heads = list(
+                (findings_root / "runs").rglob("linear-probe-final.pth.tar")
+            )
+            self.assertEqual(len(final_heads), 1)
+
     def test_two_checkpoint_sweep_reports_and_resumes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

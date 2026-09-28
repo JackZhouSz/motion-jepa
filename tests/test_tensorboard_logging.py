@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import unittest
 
-from train import _write_tensorboard_interval, _write_tensorboard_linear_probe
+from train import (
+    _write_tensorboard_interval,
+    _write_tensorboard_linear_probe,
+    _write_tensorboard_online_metrics,
+)
 
 
 class _Writer:
@@ -80,6 +84,26 @@ class TensorBoardLoggingTest(unittest.TestCase):
             writer.scalars["linear_probe/probe_best_epoch"], (17.0, 300)
         )
         self.assertEqual(writer.flush_count, 1)
+
+    def test_nested_online_metrics_are_flattened(self):
+        writer = _Writer()
+        _write_tensorboard_online_metrics(
+            writer,
+            global_step=50,
+            summary={
+                "num_samples": 16,
+                "representation": {"body": {"rankme": 3.5}},
+                "heldout_jepa": {"prediction_gain": 0.4},
+            },
+        )
+        self.assertEqual(
+            writer.scalars["online_metrics/representation/body/rankme"],
+            (3.5, 50),
+        )
+        self.assertEqual(
+            writer.scalars["online_metrics/heldout_jepa/prediction_gain"],
+            (0.4, 50),
+        )
 
 
 if __name__ == "__main__":

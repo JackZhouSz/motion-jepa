@@ -25,7 +25,13 @@ from torch.utils.data import DataLoader  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 from .cnn import MotionCNNClassifier
-from .dataset import StyleTokenDataset, build_style_datasets, load_style_label_index
+from .dataset import (
+    BabelLabelIndex,
+    StyleTokenDataset,
+    build_classification_datasets,
+    classification_dataset_kind,
+)
+from .linear import RawMotionLinearClassifier
 from .features import (
     Metrics,
     _atomic_json_save,
@@ -45,11 +51,16 @@ DEFAULT_RAW_FINDINGS_ROOT = (
     PROJECT_ROOT / "findings/000-100style-classification/classifiers"
 )
 MODELS = ("cnn", "transformer")
+AVAILABLE_MODELS = (*MODELS, "linear")
 METRIC_FIELDS = (
     "loss",
     "top1_accuracy",
     "macro_accuracy",
     "top5_accuracy",
+)
+MULTILABEL_METRIC_FIELDS = (
+    "loss", "mean_average_precision", "top1_hit", "top5_hit",
+    "classes_with_positives", "classes_without_positives",
 )
 TOKEN_CACHE_FORMAT_VERSION = 1
 CLASSIFIER_CHECKPOINT_FORMAT_VERSION = 2
@@ -64,6 +75,8 @@ class PreparedInput:
     stats_root: Path
     input_source: str
     jepa_source: dict[str, Any] | None
+    task: str = "single_label"
+    dataset_name: str = "100style"
 
 
 class MetricAccumulator:
@@ -114,6 +127,59 @@ class MetricAccumulator:
         )
 
 
+@dataclass(frozen=True)
+class MultiLabelMetrics:
+    loss: float
+    mean_average_precision: float
+    top1_hit: float
+    top5_hit: float
+    classes_with_positives: int
+    classes_without_positives: int
+
+
+class MultiLabelMetricAccumulator:
+    def __init__(self, num_classes: int) -> None:
+        self.num_classes = num_classes
+        self.loss_sum = 0.0
+        self.scores: list[torch.Tensor] = []
+        self.targets: list[torch.Tensor] = []
+
+    def update(self, logits: torch.Tensor, labels: torch.Tensor, loss_sum: float) -> None:
+        if labels.shape != logits.shape or labels.ndim != 2:
+            raise ValueError("Multi-label targets must match logits [batch, classes]")
+        self.loss_sum += float(loss_sum)
+        self.scores.append(logits.detach().float().cpu())
+        self.targets.append(labels.detach().float().cpu())
+
+    def compute(self) -> MultiLabelMetrics:
+        if not self.scores:
+            raise ValueError("Cannot compute metrics for an empty split")
+        scores = torch.cat(self.scores)
+        targets = torch.cat(self.targets)
+        if not torch.all((targets == 0) | (targets == 1)) or not torch.all(targets.sum(1) > 0):
+            raise ValueError("Multi-label targets must be nonempty binary vectors")
+        top1 = targets.gather(1, scores.argmax(dim=1, keepdim=True)).sum().item()
+        top5 = targets.gather(1, scores.topk(min(5, self.num_classes), dim=1).indices)
+        average_precisions = []
+        for class_id in range(self.num_classes):
+            positives = targets[:, class_id]
+            positive_count = int(positives.sum())
+            if positive_count == 0:
+                continue
+            order = torch.argsort(scores[:, class_id], descending=True, stable=True)
+            ranked = positives[order]
+            precision = ranked.cumsum(0) / torch.arange(1, len(ranked) + 1)
+            average_precisions.append(float((precision * ranked).sum() / positive_count))
+        return MultiLabelMetrics(
+            loss=self.loss_sum / len(scores),
+            mean_average_precision=sum(average_precisions) / len(average_precisions),
+            top1_hit=float(top1 / len(scores)),
+            top5_hit=float(top5.any(dim=1).float().mean()),
+            classes_with_positives=len(average_precisions),
+            classes_without_positives=self.num_classes - len(average_precisions),
+        )
+
+
 def make_classifier(
     model_name: str,
     *,
@@ -157,6 +223,17 @@ def make_classifier(
             "drop_path_rate": 0.1,
         }
         model = MotionTransformerClassifier(
+            **{key: value for key, value in config.items() if key != "name"}
+        )
+    elif model_name == "linear":
+        config = {
+            "name": "RawMotionLinearClassifier",
+            "input_dim": resolved_input_dim,
+            "num_frames": num_frames,
+            "num_classes": num_classes,
+            "pooling": "valid_frame_mean",
+        }
+        model = RawMotionLinearClassifier(
             **{key: value for key, value in config.items() if key != "name"}
         )
     else:
@@ -220,18 +297,25 @@ def train_epoch(
     num_classes: int,
     use_bfloat16: bool,
     gradient_clip: float,
-) -> Metrics:
+    task: str = "single_label",
+) -> Metrics | MultiLabelMetrics:
     model.train()
-    metrics = MetricAccumulator(num_classes)
+    metrics = MultiLabelMetricAccumulator(num_classes) if task == "multilabel" else MetricAccumulator(num_classes)
     for motion, _, length, labels, _ in loader:
         motion = motion.to(device=device, dtype=torch.float32, non_blocking=True)
         length = length.to(device=device, non_blocking=True)
-        labels = labels.to(device=device, dtype=torch.long, non_blocking=True)
+        labels = labels.to(
+            device=device, dtype=torch.float32 if task == "multilabel" else torch.long,
+            non_blocking=True,
+        )
         active = _valid_frames(motion, length)
         optimizer.zero_grad(set_to_none=True)
         with _amp_context(device, use_bfloat16):
             logits = model(motion, active)
-            loss = F.cross_entropy(logits, labels)
+            loss = (
+                F.binary_cross_entropy_with_logits(logits, labels)
+                if task == "multilabel" else F.cross_entropy(logits, labels)
+            )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
         optimizer.step()
@@ -246,17 +330,25 @@ def evaluate(
     device: torch.device,
     num_classes: int,
     use_bfloat16: bool,
-) -> Metrics:
+    task: str = "single_label",
+) -> Metrics | MultiLabelMetrics:
     model.eval()
-    metrics = MetricAccumulator(num_classes)
+    metrics = MultiLabelMetricAccumulator(num_classes) if task == "multilabel" else MetricAccumulator(num_classes)
     with torch.inference_mode():
         for motion, _, length, labels, _ in loader:
             motion = motion.to(device=device, dtype=torch.float32, non_blocking=True)
             length = length.to(device=device, non_blocking=True)
-            labels = labels.to(device=device, dtype=torch.long, non_blocking=True)
+            labels = labels.to(
+                device=device, dtype=torch.float32 if task == "multilabel" else torch.long,
+                non_blocking=True,
+            )
             with _amp_context(device, use_bfloat16):
                 logits = model(motion, _valid_frames(motion, length))
-                loss_sum = F.cross_entropy(logits, labels, reduction="sum")
+                loss_sum = (
+                    F.binary_cross_entropy_with_logits(logits, labels, reduction="sum")
+                    / num_classes
+                    if task == "multilabel" else F.cross_entropy(logits, labels, reduction="sum")
+                )
             metrics.update(logits, labels, float(loss_sum))
     return metrics.compute()
 
@@ -286,6 +378,7 @@ def _token_cache_metadata(
     checkpoint_key: str,
     model_info: dict[str, Any],
     class_names: list[str],
+    task: str = "single_label",
 ) -> dict[str, Any]:
     metadata = {
         "format_version": TOKEN_CACHE_FORMAT_VERSION,
@@ -309,7 +402,14 @@ def _token_cache_metadata(
         "dtype": "bfloat16",
         "class_names": class_names,
     }
-    for key in ("token_num_joints", "spatial_grouping", "spatial_pooling"):
+    if task == "multilabel":
+        metadata["task"] = task
+        metadata["label_format"] = "multi_hot_float32"
+    for key in (
+        "token_num_joints", "spatial_grouping", "spatial_pooling",
+        "spatial_token_names", "trajectory_token_index", "body_token_offset",
+        "trajectory_fields",
+    ):
         if key in model_info:
             metadata[key] = model_info[key]
     if model_info["kind"] == "2d":
@@ -390,7 +490,7 @@ def _extract_token_features(
             feature_batches.append(encoded.to(dtype=torch.bfloat16).cpu())
             token_lengths = encoder.token_layout.valid_token_lengths(length_device)
             length_batches.append(token_lengths.to(dtype=torch.long).cpu())
-            label_batches.append(labels.to(dtype=torch.long).cpu())
+            label_batches.append(labels.cpu())
             sample_ids.extend(list(ids))
     if not feature_batches:
         raise ValueError("Cannot extract JEPA tokens from an empty split")
@@ -438,10 +538,11 @@ def _prepare_input(
 ) -> PreparedInput:
     dataset_root = Path(args.dataset_root).expanduser().resolve()
     dataset_info = _read_dataset_meta(dataset_root)
+    task, dataset_name = classification_dataset_kind(dataset_root)
     input_source = str(_argument(args, "input_source", "raw"))
     if input_source == "raw":
         stats_root = dataset_root / "stats"
-        datasets, label_index = build_style_datasets(
+        datasets, label_index = build_classification_datasets(
             dataset_root,
             num_frames=dataset_info["num_frames"],
             fps=dataset_info["fps"],
@@ -456,6 +557,8 @@ def _prepare_input(
             stats_root=stats_root.resolve(),
             input_source="raw",
             jepa_source=None,
+            task=task,
+            dataset_name=dataset_name,
         )
     if input_source != "jepa":
         raise ValueError(f"Unknown input source: {input_source}")
@@ -479,20 +582,20 @@ def _prepare_input(
     stats_root = resolve_pretraining_stats(
         config, Path(stats_value) if stats_value is not None else None
     )
-    label_index = load_style_label_index(dataset_root)
-    motion_datasets, _ = build_style_datasets(
+    motion_datasets, label_index = build_classification_datasets(
         dataset_root,
         num_frames=model_info["num_frames"],
         fps=model_info["fps"],
         motion_dim=model_info["motion_dim"],
         stats_root=stats_root,
-        label_index=label_index,
     )
     cache_value = _argument(args, "feature_cache_root", None)
+    default_cache_root = checkpoint_path.parent / "linear-probe/token-features"
+    if task == "multilabel":
+        default_cache_root /= dataset_name
     cache_root = (
         Path(cache_value).expanduser().resolve()
-        if cache_value is not None
-        else checkpoint_path.parent / "linear-probe/token-features"
+        if cache_value is not None else default_cache_root
     )
     cache_root.mkdir(parents=True, exist_ok=True)
     token_datasets: dict[str, StyleTokenDataset] = {}
@@ -507,18 +610,33 @@ def _prepare_input(
             checkpoint_key=checkpoint_key,
             model_info=model_info,
             class_names=class_names,
+            task=task,
         )
-        payload = _load_or_extract_token_split(
-            cache_path=cache_root / f"{split}.pt",
-            metadata=metadata,
-            label_index=label_index,
-            dataset=motion_datasets[split],
-            encoder=encoder,
-            device=device,
-            feature_batch_size=feature_batch_size,
-            num_workers=args.num_workers,
-            recompute=bool(_argument(args, "recompute_features", False)),
-        )
+        if len(motion_datasets[split]) == 0:
+            payload = {
+                "features": torch.empty(
+                    (0, model_info["token_num_frames"], model_info["feature_dim"]),
+                    dtype=torch.bfloat16,
+                ),
+                "lengths": torch.empty(0, dtype=torch.long),
+                "labels": torch.empty(
+                    (0, label_index.num_classes), dtype=torch.float32
+                ) if task == "multilabel" else torch.empty(0, dtype=torch.long),
+                "sample_ids": [],
+                "metadata": metadata,
+            }
+        else:
+            payload = _load_or_extract_token_split(
+                cache_path=cache_root / f"{split}.pt",
+                metadata=metadata,
+                label_index=label_index,
+                dataset=motion_datasets[split],
+                encoder=encoder,
+                device=device,
+                feature_batch_size=feature_batch_size,
+                num_workers=args.num_workers,
+                recompute=bool(_argument(args, "recompute_features", False)),
+            )
         token_datasets[split] = StyleTokenDataset(
             payload, label_index=label_index, fps=model_info["fps"]
         )
@@ -538,7 +656,11 @@ def _prepare_input(
         "token_cache_dtype": "bfloat16",
         "token_cache_format_version": TOKEN_CACHE_FORMAT_VERSION,
     }
-    for key in ("token_num_joints", "spatial_grouping", "spatial_pooling"):
+    for key in (
+        "token_num_joints", "spatial_grouping", "spatial_pooling",
+        "spatial_token_names", "trajectory_token_index", "body_token_offset",
+        "trajectory_fields",
+    ):
         if key in model_info:
             jepa_source[key] = model_info[key]
     del encoder, motion_datasets
@@ -552,6 +674,8 @@ def _prepare_input(
         stats_root=stats_root,
         input_source="jepa",
         jepa_source=jepa_source,
+        task=task,
+        dataset_name=dataset_name,
     )
 
 
@@ -602,17 +726,21 @@ def _signature(
         "gradient_clip": args.gradient_clip,
         "use_bfloat16": args.use_bfloat16,
     }
+    if prepared.task == "multilabel":
+        signature["task"] = prepared.task
+        signature["selection_metric"] = "val_mean_average_precision"
     if prepared.jepa_source is not None:
         signature["jepa_source"] = prepared.jepa_source
     return signature
 
 
-def _result_fields() -> list[str]:
+def _result_fields(task: str = "single_label") -> list[str]:
+    metric_fields = MULTILABEL_METRIC_FIELDS if task == "multilabel" else METRIC_FIELDS
     return [
         "epoch",
         "learning_rate",
-        *[f"train_{field}" for field in METRIC_FIELDS],
-        *[f"val_{field}" for field in METRIC_FIELDS],
+        *[f"train_{field}" for field in metric_fields],
+        *[f"val_{field}" for field in metric_fields],
     ]
 
 
@@ -629,9 +757,18 @@ def run_model(
     device = resolve_device(args.device) if device is None else device
     datasets = prepared.datasets
     label_index = prepared.label_index
-    train_labels = {int(label) for label in datasets["train"].labels}
+    validation_used = len(datasets["val"]) > 0
+    selection = "validation_best" if validation_used else "fixed_last_epoch"
+    if prepared.task == "multilabel":
+        labels = datasets["train"].labels
+        target_matrix = labels if isinstance(labels, torch.Tensor) else torch.stack(labels)
+        train_labels = set(
+            target_matrix.any(dim=0).nonzero(as_tuple=True)[0].tolist()
+        )
+    else:
+        train_labels = {int(label) for label in datasets["train"].labels}
     missing_train = set(range(label_index.num_classes)) - train_labels
-    if missing_train:
+    if missing_train and prepared.task != "multilabel":
         raise ValueError(f"Training split is missing class IDs: {sorted(missing_train)}")
     _seed_all(args.seed)
     model, model_config = make_classifier(
@@ -656,6 +793,7 @@ def run_model(
         for name in (
             "metrics.csv",
             "classifier-best.pth.tar",
+            "classifier-final.pth.tar",
             "classifier-latest.pth.tar",
         )
         if (output / name).exists()
@@ -689,7 +827,9 @@ def run_model(
     best_epoch = 0
     best_accuracy = -1.0
     latest_path = output / "classifier-latest.pth.tar"
-    best_path = output / "classifier-best.pth.tar"
+    best_path = output / (
+        "classifier-best.pth.tar" if validation_used else "classifier-final.pth.tar"
+    )
     if args.resume and latest_path.is_file():
         checkpoint = _torch_load_checkpoint(latest_path)
         if checkpoint.get("format_version") != CLASSIFIER_CHECKPOINT_FORMAT_VERSION:
@@ -713,7 +853,7 @@ def run_model(
     _atomic_json_save(label_index.to_json(), output / "class-index.json")
 
     metrics_path = output / "metrics.csv"
-    fields = _result_fields()
+    fields = _result_fields(prepared.task)
     mode = "a" if start_epoch else "w"
     if start_epoch:
         if not metrics_path.is_file():
@@ -735,24 +875,39 @@ def run_model(
                 num_classes=label_index.num_classes,
                 use_bfloat16=args.use_bfloat16,
                 gradient_clip=args.gradient_clip,
+                task=prepared.task,
             )
-            val_metrics = evaluate(
-                model,
-                loaders["val"],
-                device=device,
-                num_classes=label_index.num_classes,
-                use_bfloat16=args.use_bfloat16,
-            )
+            val_metrics = None
+            if validation_used:
+                val_metrics = evaluate(
+                    model,
+                    loaders["val"],
+                    device=device,
+                    num_classes=label_index.num_classes,
+                    use_bfloat16=args.use_bfloat16,
+                    task=prepared.task,
+                )
             row = {
                 "epoch": epoch + 1,
                 "learning_rate": current_lr,
                 **{f"train_{key}": value for key, value in asdict(train_metrics).items()},
-                **{f"val_{key}": value for key, value in asdict(val_metrics).items()},
+                **(
+                    {f"val_{key}": value for key, value in asdict(val_metrics).items()}
+                    if val_metrics is not None
+                    else {f"val_{key}": "" for key in (
+                        MULTILABEL_METRIC_FIELDS if prepared.task == "multilabel" else METRIC_FIELDS
+                    )}
+                ),
             }
             writer.writerow(row)
             file.flush()
-            if val_metrics.top1_accuracy > best_accuracy:
-                best_accuracy = val_metrics.top1_accuracy
+            score = (
+                val_metrics.mean_average_precision
+                if prepared.task == "multilabel" and val_metrics is not None
+                else val_metrics.top1_accuracy if val_metrics is not None else None
+            )
+            if score is not None and score > best_accuracy:
+                best_accuracy = score
                 best_epoch = epoch + 1
                 _atomic_torch_save(
                     {
@@ -777,41 +932,70 @@ def run_model(
                 },
                 latest_path,
             )
+            validation_text = f", val={score:.4f}" if score is not None else ""
+            train_score = (
+                train_metrics.mean_average_precision if prepared.task == "multilabel"
+                else train_metrics.top1_accuracy
+            )
             print(
                 f"{model_name} epoch {epoch + 1:03d}/{args.epochs}: "
-                f"train={train_metrics.top1_accuracy:.4f}, "
-                f"val={val_metrics.top1_accuracy:.4f}, lr={current_lr:.3e}",
+                f"train={train_score:.4f}{validation_text}, "
+                f"lr={current_lr:.3e}",
                 flush=True,
             )
+
+    if not validation_used:
+        best_epoch = args.epochs
+        best_accuracy = float("nan")
+        _atomic_torch_save(
+            {
+                "format_version": CLASSIFIER_CHECKPOINT_FORMAT_VERSION,
+                "model": model.state_dict(),
+                "architecture": model_config,
+                "selection": selection,
+            },
+            best_path,
+        )
 
     best = _torch_load_checkpoint(best_path)
     if best.get("format_version") != CLASSIFIER_CHECKPOINT_FORMAT_VERSION:
         raise ValueError("Unsupported best classifier checkpoint format")
     model.load_state_dict(best["model"], strict=True)
-    best_val_metrics = evaluate(
-        model,
-        loaders["val"],
-        device=device,
-        num_classes=label_index.num_classes,
-        use_bfloat16=args.use_bfloat16,
-    )
-    test_metrics = evaluate(
-        model,
-        loaders["test"],
-        device=device,
-        num_classes=label_index.num_classes,
-        use_bfloat16=args.use_bfloat16,
+    best_val_metrics = None
+    if validation_used:
+        best_val_metrics = evaluate(
+            model,
+            loaders["val"],
+            device=device,
+            num_classes=label_index.num_classes,
+            use_bfloat16=args.use_bfloat16,
+            task=prepared.task,
+        )
+    test_metrics = (
+        evaluate(
+            model, loaders["test"], device=device,
+            num_classes=label_index.num_classes,
+            use_bfloat16=args.use_bfloat16, task=prepared.task,
+        )
+        if len(datasets["test"]) else None
     )
     summary = {
         "status": "complete",
         "model": model_name,
         "num_parameters": num_parameters,
         "best_epoch": best_epoch,
-        "best_val": asdict(best_val_metrics),
-        "test": asdict(test_metrics),
+        "best_val": None if best_val_metrics is None else asdict(best_val_metrics),
+        "selection": selection,
+        "validation_used": validation_used,
+        "head_filename": best_path.name,
+        "test": None if test_metrics is None else asdict(test_metrics),
         "split_counts": {split: len(dataset) for split, dataset in datasets.items()},
         "signature": signature,
     }
+    if prepared.task == "multilabel":
+        summary["task"] = prepared.task
+        summary["missing_train_class_ids"] = sorted(missing_train)
+        summary["selection_metric"] = "val_mean_average_precision"
     _atomic_json_save(summary, summary_path)
     latest_path.unlink(missing_ok=True)
     (output / "model-config.json").unlink(missing_ok=True)
@@ -833,7 +1017,12 @@ def write_findings(
     seed: int,
     input_source: str,
     jepa_source: dict[str, Any] | None,
+    task: str = "single_label",
+    dataset_name: str = "100style",
 ) -> None:
+    validation_used = all(
+        bool(summary.get("validation_used", True)) for summary in summaries.values()
+    )
     findings_root.mkdir(parents=True, exist_ok=True)
     _atomic_json_save(
         {
@@ -850,25 +1039,76 @@ def write_findings(
         with path.open(encoding="utf-8", newline="") as file:
             metrics[model_name] = list(csv.DictReader(file))
 
+    score_field = "mean_average_precision" if task == "multilabel" else "top1_accuracy"
+    score_title = "Mean AP (%)" if task == "multilabel" else "Top-1 (%)"
     figure, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
     for model_name, color in (("cnn", "tab:blue"), ("transformer", "tab:orange")):
         rows = metrics[model_name]
         epochs = [int(row["epoch"]) for row in rows]
         axes[0, 0].plot(epochs, [float(row["train_loss"]) for row in rows], label=model_name, color=color)
-        axes[0, 1].plot(epochs, [float(row["val_loss"]) for row in rows], label=model_name, color=color)
-        axes[1, 0].plot(epochs, [float(row["train_top1_accuracy"]) * 100 for row in rows], label=model_name, color=color)
-        axes[1, 1].plot(epochs, [float(row["val_top1_accuracy"]) * 100 for row in rows], label=model_name, color=color)
-    titles = (("Train loss", "Validation loss"), ("Train top-1 (%)", "Validation top-1 (%)"))
+        axes[1, 0].plot(epochs, [float(row[f"train_{score_field}"]) * 100 for row in rows], label=model_name, color=color)
+        if validation_used:
+            axes[0, 1].plot(epochs, [float(row["val_loss"]) for row in rows], label=model_name, color=color)
+            axes[1, 1].plot(epochs, [float(row[f"val_{score_field}"]) * 100 for row in rows], label=model_name, color=color)
+    titles = (("Train loss", "Validation loss"), (f"Train {score_title}", f"Validation {score_title}"))
     for row_index, row_axes in enumerate(axes):
         for column_index, axis in enumerate(row_axes):
             axis.set_title(titles[row_index][column_index])
             axis.grid(True, alpha=0.25)
-            axis.legend()
+            if axis.lines:
+                axis.legend()
+    if not validation_used:
+        for axis in (axes[0, 1], axes[1, 1]):
+            axis.text(0.5, 0.5, "Validation disabled", ha="center", va="center", transform=axis.transAxes)
     axes[1, 0].set_xlabel("Epoch")
     axes[1, 1].set_xlabel("Epoch")
     figure.tight_layout()
     figure.savefig(findings_root / "training-curves.png", dpi=180)
     plt.close(figure)
+
+    if task == "multilabel":
+        lines = [
+            f"# {dataset_name.upper()} multi-label classifiers",
+            "",
+            f"Input: {'raw motion' if input_source == 'raw' else 'frozen JEPA tokens'}; seed {seed}.",
+            "One motion chunk has one binary target vector containing all its action labels.",
+            "BCEWithLogitsLoss is used without class weights or balanced sampling.",
+            "The best checkpoint is selected by validation mean AP.",
+            "Classes with no positives in a split are excluded from that split's mean AP.",
+            "Top-1/top-5 hit means at least one predicted class is in the target set.",
+            "Validation is used for model selection and reporting; the public test split is empty.",
+            "",
+            "![Training curves](training-curves.png)",
+            "",
+            "| Model | Parameters | Best epoch | Val mean AP | Val top-1 hit | Val top-5 hit | Missing train classes |",
+            "|---|---:|---:|---:|---:|---:|---|",
+        ]
+        if jepa_source is not None:
+            lines[2:2] = [
+                f"JEPA checkpoint: `{jepa_source['checkpoint_path']}`",
+                f"Checkpoint key: `{jepa_source['checkpoint_key']}`",
+            ]
+        for model_name in MODELS:
+            summary = summaries[model_name]
+            val = summary["best_val"]
+            values = (
+                f"{val['mean_average_precision'] * 100:.2f}",
+                f"{val['top1_hit'] * 100:.2f}",
+                f"{val['top5_hit'] * 100:.2f}",
+            ) if val is not None else ("-", "-", "-")
+            lines.append(
+                f"| {model_name} | {summary['num_parameters']:,} | {summary['best_epoch']} | "
+                f"{values[0]} | {values[1]} | {values[2]} | "
+                f"{summary['missing_train_class_ids']} |"
+            )
+        lines.extend([
+            "", "## Files", "",
+            "- [CNN metrics](cnn-metrics.csv)",
+            "- [Transformer metrics](transformer-metrics.csv)",
+            "- [Classifier summaries](results.json)", "",
+        ])
+        (findings_root / "README.md").write_text("\n".join(lines), encoding="utf-8")
+        return
 
     source_description = (
         "100STYLE raw motion `[90,366]`"
@@ -894,7 +1134,11 @@ def write_findings(
         "- AdamW, LR 3e-4, weight decay 0.05",
         "- 5-epoch warmup followed by cosine decay, 100 epochs",
         "- CUDA BF16 autocast; float32 parameters and optimizer",
-        "- Best validation top-1 checkpoint restored before one test evaluation",
+        (
+            "- Best validation top-1 checkpoint restored before one test evaluation"
+            if validation_used
+            else "- Fixed last-epoch checkpoint followed by one test evaluation"
+        ),
         "",
         "![Training curves](training-curves.png)",
         "",
@@ -914,10 +1158,19 @@ def write_findings(
         summary = summaries[model_name]
         val = summary["best_val"]
         test = summary["test"]
+        val_values = (
+            ("-", "-", "-")
+            if val is None
+            else (
+                f"{val['top1_accuracy'] * 100:.2f}",
+                f"{val['macro_accuracy'] * 100:.2f}",
+                f"{val['top5_accuracy'] * 100:.2f}",
+            )
+        )
         lines.append(
             f"| {model_name} | {summary['num_parameters']:,} | {summary['best_epoch']} | "
-            f"{val['top1_accuracy'] * 100:.2f} | {val['macro_accuracy'] * 100:.2f} | "
-            f"{val['top5_accuracy'] * 100:.2f} | {test['top1_accuracy'] * 100:.2f} | "
+            f"{val_values[0]} | {val_values[1]} | {val_values[2]} | "
+            f"{test['top1_accuracy'] * 100:.2f} | "
             f"{test['macro_accuracy'] * 100:.2f} | {test['top5_accuracy'] * 100:.2f} |"
         )
     lines.extend(
@@ -950,18 +1203,28 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
         raise ValueError("feature_batch_size must be positive")
     device = resolve_device(args.device)
     input_source = str(_argument(args, "input_source", "raw"))
+    if args.model == "linear" and input_source != "raw":
+        raise ValueError("The linear baseline supports only normalized raw motion")
     checkpoint_value = _argument(args, "jepa_checkpoint", None)
     output_value = _argument(args, "output_root", None)
     findings_value = _argument(args, "findings_root", None)
+    task, dataset_name = classification_dataset_kind(
+        Path(args.dataset_root).expanduser().resolve()
+    )
     if input_source == "jepa":
         if checkpoint_value is None:
             raise ValueError("--jepa-checkpoint is required for --input-source jepa")
         checkpoint_root = Path(checkpoint_value).expanduser().resolve().parent
         default_output = checkpoint_root / "linear-probe/classifiers"
+        if task == "multilabel":
+            default_output = default_output / dataset_name
         default_findings = default_output / "findings"
     else:
-        default_output = PROJECT_ROOT / "output/100style-classifiers"
-        default_findings = DEFAULT_RAW_FINDINGS_ROOT
+        default_output = PROJECT_ROOT / f"output/{dataset_name}-classifiers"
+        default_findings = (
+            default_output / "findings"
+            if task == "multilabel" else DEFAULT_RAW_FINDINGS_ROOT
+        )
     output_root = (
         Path(output_value).expanduser().resolve()
         if output_value is not None
@@ -992,15 +1255,17 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
             seed=args.seed,
             input_source=prepared.input_source,
             jepa_source=prepared.jepa_source,
+            task=prepared.task,
+            dataset_name=prepared.dataset_name,
         )
     return summaries
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train 100STYLE classifiers from raw motion or frozen JEPA tokens"
+        description="Train 100STYLE or BABEL classifiers from raw motion or frozen JEPA tokens"
     )
-    parser.add_argument("--model", choices=(*MODELS, "all"), default="all")
+    parser.add_argument("--model", choices=(*AVAILABLE_MODELS, "all"), default="all")
     parser.add_argument("--input-source", choices=("raw", "jepa"), default="raw")
     parser.add_argument("--jepa-checkpoint", type=Path, default=None)
     parser.add_argument(

@@ -24,20 +24,9 @@ class MaskVisualizationTest(unittest.TestCase):
         config["data"]["num_frames"] = 12
         return config
 
-    def test_raw_and_patch_layouts_sample_and_render(self):
+    def test_active_trajectory_patch_layout_samples_and_renders(self):
         cases = (
-            ("mjepa_1d_base.yaml", "1d", False, 12, None),
-            ("mjepa_patch_1d_base.yaml", "1d", True, 4, None),
-            ("mjepa_2d_base.yaml", "2d", False, 12, 30),
-            ("mjepa_patch_2d_base_fine11.yaml", "2d", True, 4, 11),
-            ("mjepa_patch_2d_base_coarse7.yaml", "2d", True, 4, 7),
-            (
-                "mjepa_patch_2d_tiny_coarse7_body_region_segment.yaml",
-                "2d",
-                True,
-                4,
-                7,
-            ),
+            ("mjepa_patch_2d_tiny_coarse7.yaml", "2d", True, 4, 8),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -66,7 +55,7 @@ class MaskVisualizationTest(unittest.TestCase):
                 )
 
     def test_seed_and_sample_selection_are_deterministic(self):
-        config = self._config("mjepa_patch_2d_base_fine11.yaml")
+        config = self._config("mjepa_patch_2d_tiny_coarse7.yaml")
         first = sample_masks(
             config, seed=9, valid_length=12, batch_size=2, sample_index=1
         )
@@ -87,7 +76,7 @@ class MaskVisualizationTest(unittest.TestCase):
                     str(Path("/opt/conda/envs/kimodo/bin/python")),
                     str(PROJECT_ROOT / "visualize_mask.py"),
                     "--config",
-                    str(PROJECT_ROOT / "configs/mjepa_patch_2d_base_coarse7.yaml"),
+                    str(PROJECT_ROOT / "configs/mjepa_patch_2d_tiny_coarse7.yaml"),
                     "--output",
                     str(output),
                     "--seed",
@@ -102,7 +91,7 @@ class MaskVisualizationTest(unittest.TestCase):
             )
             self.assertTrue(output.is_file())
             self.assertIn("Saved mask visualization", completed.stdout)
-            self.assertIn('"token_num_joints": 7', completed.stdout)
+            self.assertIn('"token_num_joints": 8', completed.stdout)
 
 
 if __name__ == "__main__":

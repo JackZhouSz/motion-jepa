@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from experiment.linear_probe.cnn import MotionCNNClassifier
+from experiment.linear_probe.linear import RawMotionLinearClassifier
 from experiment.linear_probe import train_classifier
 from experiment.linear_probe.train_classifier import make_classifier, run
 from experiment.linear_probe.transformer import MotionTransformerClassifier
@@ -21,6 +22,24 @@ from test_linear_probe import _write_checkpoint, _write_dataset
 
 
 class ClassifierModelTest(unittest.TestCase):
+    def test_raw_linear_is_one_affine_layer_over_masked_temporal_mean(self):
+        model = RawMotionLinearClassifier(input_dim=6, num_frames=4, num_classes=2)
+        self.assertEqual(
+            [module for module in model.modules() if isinstance(module, torch.nn.Linear)],
+            [model.head],
+        )
+        self.assertEqual(model.head.in_features, 6)
+        motion = torch.randn(3, 4, 6)
+        active = torch.tensor(
+            [[True, True, True, True], [True, True, False, False], [False] * 4]
+        )
+        self.assertEqual(model(motion, active).shape, (3, 2))
+        changed = motion.clone()
+        changed[1, 2:] = 1.0e6
+        torch.testing.assert_close(model(motion, active)[1], model(changed, active)[1])
+        expected = model.head(motion[0].mean(dim=0))
+        torch.testing.assert_close(model(motion, active)[0], expected)
+
     def test_default_raw_findings_root_is_unified_component(self):
         self.assertEqual(
             train_classifier.DEFAULT_RAW_FINDINGS_ROOT,
@@ -58,7 +77,7 @@ class ClassifierModelTest(unittest.TestCase):
             torch.testing.assert_close(first, second)
 
     def test_factory_uses_dataset_dimensions(self):
-        for name in ("cnn", "transformer"):
+        for name in ("cnn", "transformer", "linear"):
             model, config = make_classifier(
                 name, motion_dim=6, num_frames=4, num_classes=2
             )
@@ -101,6 +120,42 @@ class ClassifierModelTest(unittest.TestCase):
 
 
 class SupervisedTrainingTest(unittest.TestCase):
+    def test_validation_free_raw_linear_uses_last_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_root = root / "dataset"
+            output_root = root / "output"
+            _write_dataset(dataset_root, validation_enabled=False)
+            args = argparse.Namespace(
+                model="linear",
+                input_source="raw",
+                dataset_root=dataset_root,
+                output_root=output_root,
+                findings_root=None,
+                device="cpu",
+                seed=42,
+                epochs=2,
+                warmup_epochs=0,
+                batch_size=4,
+                num_workers=0,
+                lr=3.0e-4,
+                final_lr=1.0e-6,
+                weight_decay=0.05,
+                gradient_clip=1.0,
+                use_bfloat16=False,
+                resume=False,
+                overwrite=False,
+            )
+            summary = run(args)["linear"]
+            self.assertEqual(summary["selection"], "fixed_last_epoch")
+            self.assertFalse(summary["validation_used"])
+            self.assertEqual(summary["best_epoch"], 2)
+            self.assertIsNone(summary["best_val"])
+            self.assertEqual(summary["head_filename"], "classifier-final.pth.tar")
+            run_root = output_root / "linear/seed-42"
+            self.assertTrue((run_root / "classifier-final.pth.tar").is_file())
+            self.assertFalse((run_root / "classifier-best.pth.tar").exists())
+
     def test_two_epoch_cpu_training_outputs_and_interrupted_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

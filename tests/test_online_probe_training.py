@@ -92,6 +92,27 @@ class _FakeFixedOnlineProbe(_FakeOnlineProbe):
     calls = 0
 
 
+class _FakeOnlineMetrics:
+    calls = 0
+
+    def __init__(self, training_config, metric_config, *, device, collator):
+        del training_config, metric_config, device, collator
+        self.indices = [0, 1]
+
+    def evaluate(self, encoder, predictor):
+        if encoder.training or predictor.training:
+            raise AssertionError("Online metrics received training-mode models")
+        type(self).calls += 1
+        return {
+            "num_samples": 2,
+            "representation": {"body": {"rankme": 2.0, "mean_std": 0.2}},
+            "heldout_jepa": {
+                "prediction_gain": 0.3,
+                "trajectory_ablation": {"trajectory_reliance": 0.1},
+            },
+        }
+
+
 class OnlineProbeTrainingTest(unittest.TestCase):
     def test_validation_free_online_probe_never_creates_best_accuracy_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,20 +149,30 @@ class OnlineProbeTrainingTest(unittest.TestCase):
                     "start_lr": 1.0e-4, "warmup": 0, "weight_decay": 0.04,
                 },
                 "linear_probe": {"enabled": True, "frequency": 1},
+                "online_metrics": {"enabled": True},
             }
             writer = _Writer()
             _FakeFixedOnlineProbe.calls = 0
+            _FakeOnlineMetrics.calls = 0
             with patch(
                 "experiment.linear_probe.online.OnlineLinearProbe", _FakeFixedOnlineProbe
+            ), patch(
+                "experiment.online_metrics.OnlineRepresentationMetrics",
+                _FakeOnlineMetrics,
             ), patch("train._make_tensorboard_writer", return_value=writer):
                 train_main(config, device="cpu")
             self.assertEqual(_FakeFixedOnlineProbe.calls, 2)
+            self.assertEqual(_FakeOnlineMetrics.calls, 2)
             self.assertFalse((output / "fixed-probe-best-accuracy.pth.tar").exists())
             latest = torch.load(
                 output / "fixed-probe-latest.pth.tar", map_location="cpu", weights_only=False
             )
             self.assertEqual(latest["linear_probe_latest"]["selection"], "fixed_last_epoch")
             self.assertIsNone(latest["best_probe_epoch"])
+            self.assertEqual(latest["online_metrics_latest"]["pretrain_epoch"], 1)
+            self.assertEqual(
+                len((output / "online-metrics.jsonl").read_text().splitlines()), 2
+            )
             self.assertEqual(
                 [event for event in writer.scalars if event[0] == "linear_probe/test_top1_accuracy"],
                 [("linear_probe/test_top1_accuracy", 0.55, 0),

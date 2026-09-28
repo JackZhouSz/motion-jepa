@@ -11,6 +11,7 @@ from mask import (
     PatchMaskCollator1D,
     PatchMaskCollator2D,
     PatchRandomBodySegmentMaskCollator2D,
+    PatchRandomSpatialSegmentMaskCollator2D,
 )
 from mask.body_region_collator import COARSE7_GRAPH_EDGES
 from model import TokenLayout
@@ -333,6 +334,95 @@ class PatchMaskCollatorTest(unittest.TestCase):
         self.assertIsInstance(
             _build_mask_collator(config, layout),
             PatchRandomBodySegmentMaskCollator2D,
+        )
+
+    @staticmethod
+    def _random_spatial_collator(**kwargs):
+        options = {
+            "raw_num_frames": 90,
+            "raw_num_joints": 30,
+            "token_num_joints": 8,
+            "temporal_patch_size": 3,
+            "spatial_grouping": "coarse7",
+            "spatial_pooling": "graph_mean",
+            "pred_frame_mask_ratio": (0.4, 0.6),
+            "pred_spatial_mask_count": 4,
+            "target_union_ratio": (0.55, 0.65),
+            "npred": 4,
+        }
+        options.update(kwargs)
+        return PatchRandomSpatialSegmentMaskCollator2D(**options)
+
+    def test_random_spatial_masks_use_integer_count_overlap_and_union_bounds(self):
+        collator = self._random_spatial_collator()
+        batch = [(torch.zeros(90, 366), 30, 90) for _ in range(16)]
+        _, contexts, targets = collator(batch)
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(len(targets), 4)
+        target_count = int(targets[0][0].sum())
+        self.assertGreaterEqual(target_count, 12 * 4)
+        self.assertLessEqual(target_count, 18 * 4)
+        for target in targets:
+            self.assertEqual(target.flatten(1).sum(1).tolist(), [target_count] * 16)
+            for sample in target:
+                active_frames = torch.nonzero(sample.any(dim=1)).flatten()
+                self.assertTrue(
+                    bool((active_frames[1:] - active_frames[:-1] == 1).all())
+                )
+                self.assertEqual(int(sample[active_frames[0]].sum()), 4)
+        union = torch.stack(targets).any(dim=0)
+        union_ratios = union.flatten(1).float().mean(dim=1)
+        self.assertTrue(bool(((union_ratios >= 0.55) & (union_ratios <= 0.65)).all()))
+        self.assertFalse(bool((contexts[0] & union).any()))
+        torch.testing.assert_close(contexts[0] | union, torch.ones_like(union))
+        self.assertTrue(bool((torch.stack(targets).sum(dim=0) > 1).any()))
+
+    def test_random_spatial_masks_can_select_trajectory_and_restore_state(self):
+        batch = [(torch.zeros(90, 366), 30, 90) for _ in range(8)]
+        first = self._random_spatial_collator()
+        saw_trajectory = False
+        for _ in range(8):
+            _, _, targets = first(batch)
+            saw_trajectory |= any(bool(target[..., 0].any()) for target in targets)
+        self.assertTrue(saw_trajectory)
+        state = first.state_dict()
+        expected = first(batch)[1:]
+        restored = self._random_spatial_collator()
+        restored.load_state_dict(state)
+        actual = restored(batch)[1:]
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_mask, actual_mask in zip(expected_group, actual_group):
+                torch.testing.assert_close(actual_mask, expected_mask)
+
+    def test_builder_selects_random_spatial_segment(self):
+        layout = TokenLayout(
+            kind="2d",
+            patchified=True,
+            raw_num_frames=90,
+            token_num_frames=30,
+            temporal_patch_size=3,
+            raw_num_joints=30,
+            token_num_joints=8,
+        )
+        config = {
+            "patch": {
+                "spatial_grouping": "coarse7",
+                "spatial_pooling": "graph_mean",
+            },
+            "mask": {
+                "strategy": "random_spatial_segment",
+                "num_enc_masks": 1,
+                "num_pred_masks": 4,
+                "pred_frame_mask_ratio": [0.4, 0.6],
+                "pred_spatial_mask_count": 4,
+                "target_union_ratio": [0.55, 0.65],
+                "allow_target_overlap": True,
+                "allow_context_target_overlap": False,
+            },
+        }
+        self.assertIsInstance(
+            _build_mask_collator(config, layout),
+            PatchRandomSpatialSegmentMaskCollator2D,
         )
 
 

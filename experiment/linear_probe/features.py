@@ -160,6 +160,15 @@ def load_frozen_encoder(
     }
     if encoder.token_layout.kind == "2d":
         info["token_num_joints"] = int(encoder.token_layout.token_num_joints)
+        if encoder.token_layout.spatial_token_names is not None:
+            info["spatial_token_names"] = list(
+                encoder.token_layout.spatial_token_names
+            )
+            info["trajectory_token_index"] = int(
+                encoder.token_layout.trajectory_token_index
+            )
+            info["body_token_offset"] = int(encoder.token_layout.body_token_offset)
+            info["trajectory_fields"] = list(encoder.token_layout.trajectory_fields)
     if hasattr(encoder, "spatial_grouping"):
         info.update(
             spatial_grouping=str(encoder.spatial_grouping),
@@ -266,7 +275,15 @@ def build_cache_metadata(
         "pooling": pooling,
         "class_names": class_names,
     }
-    for key in ("token_num_joints", "spatial_grouping", "spatial_pooling"):
+    for key in (
+        "token_num_joints",
+        "spatial_grouping",
+        "spatial_pooling",
+        "spatial_token_names",
+        "trajectory_token_index",
+        "body_token_offset",
+        "trajectory_fields",
+    ):
         if key in model_info:
             metadata[key] = model_info[key]
     return metadata

@@ -7,7 +7,7 @@ data:
   pin_mem: true
   persistent_workers: true
   drop_last: true
-  num_frames: 90
+  num_frames: 150
   fps: 30
   motion_dim: 366
   num_joints: 30

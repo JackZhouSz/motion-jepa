@@ -16,6 +16,11 @@ from model import (
     get_spatial_grouping,
     spatial_patch_signature,
 )
+from model.motion_patch_transformer_2d import (
+    BODY_TOKEN_OFFSET,
+    TRAJECTORY_FIELDS,
+    TRAJECTORY_TOKEN_INDEX,
+)
 from utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
 
 
@@ -109,7 +114,13 @@ def init_mjepa_model_from_config(config: dict, device: torch.device):
     if hasattr(predictor, "_packed_spatial_disjoint"):
         mask = config.get("mask")
         predictor._packed_spatial_disjoint = (
-            isinstance(mask, dict) and not bool(mask.get("allow_overlap", False))
+            isinstance(mask, dict)
+            and not bool(
+                mask.get(
+                    "allow_context_target_overlap",
+                    mask.get("allow_overlap", False),
+                )
+            )
         )
     return encoder, predictor
 
@@ -189,14 +200,15 @@ def architecture_signature_from_config(config: dict) -> dict:
     )
     if has_spatial_patch and pooling != "graph_mean":
         raise ValueError("Patchified 2D models support only graph_mean pooling")
-    token_joints = len(get_spatial_grouping(grouping)) if has_spatial_patch else None
+    body_groups = get_spatial_grouping(grouping) if has_spatial_patch else ()
+    token_joints = 1 + len(body_groups) if has_spatial_patch else None
 
     def layout_signature(layout_kind: str, is_patch: bool, size: int) -> dict:
         joints = int(data["num_joints"]) if layout_kind == "2d" else None
         pooled_joints = (
             int(token_joints) if layout_kind == "2d" and is_patch else joints
         )
-        return {
+        result = {
             "kind": layout_kind,
             "patchified": is_patch,
             "raw_num_frames": raw_frames,
@@ -205,6 +217,23 @@ def architecture_signature_from_config(config: dict) -> dict:
             "raw_num_joints": joints,
             "token_num_joints": pooled_joints,
         }
+        if layout_kind == "2d" and is_patch:
+            result.update(
+                trajectory_token_index=TRAJECTORY_TOKEN_INDEX,
+                body_token_offset=BODY_TOKEN_OFFSET,
+                spatial_token_names=[
+                    "trajectory", *[name for name, _ in body_groups]
+                ],
+                trajectory_fields=list(TRAJECTORY_FIELDS),
+            )
+        else:
+            result.update(
+                trajectory_token_index=None,
+                body_token_offset=None,
+                spatial_token_names=None,
+                trajectory_fields=None,
+            )
+        return result
 
     signature = {
         "model_name": model_name,
