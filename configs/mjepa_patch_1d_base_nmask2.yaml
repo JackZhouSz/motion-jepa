@@ -18,7 +18,7 @@ patch:
   temporal_patch_size: 3
 
 logging:
-  folder: ./output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150
+  folder: ./output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150-nmask2
   write_tag: motion-jepa-patch-1d-p3
   log_freq: 100
   tensorboard: true
@@ -44,7 +44,7 @@ linear_probe:
 mask:
   allow_overlap: false
   num_enc_masks: 1
-  num_pred_masks: 4
+  num_pred_masks: 2
   enc_frame_mask_ratio: [0.85, 1.0]
   pred_frame_mask_ratio: [0.15, 0.2]
 

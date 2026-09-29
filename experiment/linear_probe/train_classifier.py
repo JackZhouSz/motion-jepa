@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 from .cnn import MotionCNNClassifier
+from .attentive import AttentiveProbe
 from .dataset import (
     ClassificationTokenDataset,
     MultiLabelIndex,
@@ -51,7 +52,7 @@ DEFAULT_RAW_FINDINGS_ROOT = (
     PROJECT_ROOT / "findings/000-100style-classification/classifiers"
 )
 MODELS = ("cnn", "transformer")
-AVAILABLE_MODELS = (*MODELS, "linear")
+AVAILABLE_MODELS = (*MODELS, "linear", "attentive")
 METRIC_FIELDS = (
     "loss",
     "top1_accuracy",
@@ -251,6 +252,16 @@ def make_classifier(
         model = MotionTransformerClassifier(
             **{key: value for key, value in config.items() if key != "name"}
         )
+    elif model_name == "attentive":
+        config = {
+            "name": "AttentiveProbe",
+            "input_dim": resolved_input_dim,
+            "num_frames": num_frames,
+            "num_classes": num_classes,
+            "num_heads": 6,
+            "mlp_ratio": 4.0,
+        }
+        model = AttentiveProbe(**{key: value for key, value in config.items() if key != "name"})
     elif model_name == "linear":
         config = {
             "name": "RawMotionLinearClassifier",
@@ -817,6 +828,8 @@ def run_model(
     output_root: Path,
     device: torch.device | None = None,
 ) -> dict[str, Any]:
+    if model_name == "attentive" and prepared.input_source != "jepa":
+        raise ValueError("Attentive probing requires frozen JEPA tokens")
     dataset_root = Path(args.dataset_root).expanduser().resolve()
     output = output_root / model_name / f"seed-{args.seed}"
     device = resolve_device(args.device) if device is None else device
@@ -960,6 +973,8 @@ def run_model(
         generator=generator,
     )
     _atomic_json_save(label_index.to_json(), output / "class-index.json")
+    if model_name == "attentive":
+        _atomic_json_save(model_config, output / "model-config.json")
 
     metrics_path = output / "metrics.csv"
     fields = _result_fields(prepared.task)
@@ -1131,8 +1146,9 @@ def run_model(
         if pos_weight_cpu is not None:
             summary["pos_weight"] = signature["pos_weight"]
     _atomic_json_save(summary, summary_path)
-    latest_path.unlink(missing_ok=True)
-    (output / "model-config.json").unlink(missing_ok=True)
+    if model_name != "attentive":
+        latest_path.unlink(missing_ok=True)
+        (output / "model-config.json").unlink(missing_ok=True)
     return summary
 
 
@@ -1385,6 +1401,8 @@ def run(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     input_source = str(_argument(args, "input_source", "raw"))
     if args.model == "linear" and input_source != "raw":
         raise ValueError("The linear baseline supports only normalized raw motion")
+    if args.model == "attentive" and input_source != "jepa":
+        raise ValueError("Attentive probing requires --input-source jepa")
     checkpoint_value = _argument(args, "jepa_checkpoint", None)
     output_value = _argument(args, "output_root", None)
     findings_value = _argument(args, "findings_root", None)

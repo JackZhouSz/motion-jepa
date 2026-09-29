@@ -312,6 +312,7 @@ def train_multilabel_probe(
     momentum: float,
     weight_decay: float,
     seed: int,
+    output: Path | None = None,
 ) -> dict[str, Any]:
     """Fit a fresh in-memory BABEL head and select it by validation mAP."""
     train = caches["train"]
@@ -345,8 +346,13 @@ def train_multilabel_probe(
     best_score = float("-inf")
     best_epoch = None
     best_metrics = None
+    history = []
+    if output is not None:
+        output.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, epochs + 1):
         classifier.train()
+        current_lr = float(optimizer.param_groups[0]["lr"])
+        train_loss_sum = 0.0
         for features, labels in loader:
             features = features.to(device=device, dtype=torch.float32)
             labels = labels.to(device=device, dtype=torch.float32)
@@ -354,6 +360,8 @@ def train_multilabel_probe(
             loss = F.binary_cross_entropy_with_logits(classifier(features), labels)
             loss.backward()
             optimizer.step()
+            if output is not None:
+                train_loss_sum += float(loss.detach()) * len(labels)
         metrics = _evaluate_multilabel_linear_probe(
             classifier, validation, label_index=label_index,
             device=device, batch_size=batch_size,
@@ -363,6 +371,19 @@ def train_multilabel_probe(
             best_score = score
             best_epoch = epoch
             best_metrics = metrics
+            if output is not None:
+                _atomic_torch_save({
+                    "classifier": classifier.state_dict(), "epoch": epoch,
+                    "val_metrics": metrics, "feature_dim": feature_dim,
+                    "num_classes": num_classes,
+                }, output / "linear-probe-best.pth.tar")
+        if output is not None:
+            history.append({
+                "epoch": epoch, "learning_rate": current_lr,
+                "train_loss": train_loss_sum / len(train["labels"]),
+                **{f"val_{key}": value for key, value in metrics.items()},
+            })
+            _atomic_json_save(history, output / "metrics.json")
         scheduler.step()
     return {
         "best_epoch": best_epoch,
