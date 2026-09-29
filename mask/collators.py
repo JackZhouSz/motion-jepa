@@ -61,6 +61,7 @@ class MaskCollator1D(_StatefulMaskCollator):
         nenc: int = 1,
         npred: int = 4,
         allow_overlap: bool = False,
+        context_selection: str = "prefix",
     ) -> None:
         super().__init__()
         self.num_frames = int(num_frames)
@@ -69,6 +70,9 @@ class MaskCollator1D(_StatefulMaskCollator):
         self.nenc = int(nenc)
         self.npred = int(npred)
         self.allow_overlap = bool(allow_overlap)
+        if context_selection not in ("prefix", "random"):
+            raise ValueError("context_selection must be 'prefix' or 'random'")
+        self.context_selection = context_selection
         if self.num_frames <= 0 or self.nenc <= 0 or self.npred <= 0:
             raise ValueError("num_frames, nenc, and npred must be positive")
         self._configuration = {
@@ -79,7 +83,14 @@ class MaskCollator1D(_StatefulMaskCollator):
             "nenc": self.nenc,
             "npred": self.npred,
             "allow_overlap": self.allow_overlap,
+            "context_selection": self.context_selection,
         }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        # Old 1D/patch checkpoints always used prefix truncation.
+        configuration = dict(state.get("configuration", self._configuration))
+        configuration.setdefault("context_selection", "prefix")
+        super().load_state_dict({**state, "configuration": configuration})
 
     @staticmethod
     def _interval(
@@ -134,7 +145,9 @@ class MaskCollator1D(_StatefulMaskCollator):
             batch_pred.append(targets)
             batch_enc.append(contexts)
 
-        def pack(blocks: list[list[torch.Tensor]], count: int) -> list[torch.Tensor]:
+        def pack(
+            blocks: list[list[torch.Tensor]], count: int, selection: str = "prefix"
+        ) -> list[torch.Tensor]:
             indices_by_block = [
                 [torch.nonzero(sample[index], as_tuple=False).flatten() for sample in blocks]
                 for index in range(count)
@@ -142,9 +155,19 @@ class MaskCollator1D(_StatefulMaskCollator):
             minimum = min(len(indices) for block in indices_by_block for indices in block)
             if minimum <= 0:
                 raise ValueError("Mask configuration generated an empty block")
-            return [torch.stack([indices[:minimum] for indices in block]) for block in indices_by_block]
+            def select(indices: torch.Tensor) -> torch.Tensor:
+                if selection == "random" and len(indices) > minimum:
+                    chosen = torch.randperm(len(indices), generator=generator)[:minimum]
+                    return indices[chosen].sort().values
+                return indices[:minimum]
 
-        return collated_batch, pack(batch_enc, self.nenc), pack(batch_pred, self.npred)
+            return [torch.stack([select(indices) for indices in block]) for block in indices_by_block]
+
+        return (
+            collated_batch,
+            pack(batch_enc, self.nenc, self.context_selection),
+            pack(batch_pred, self.npred),
+        )
 
 
 class MaskCollator2D(_StatefulMaskCollator):

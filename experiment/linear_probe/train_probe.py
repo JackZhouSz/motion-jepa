@@ -16,6 +16,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .dataset import MultiLabelIndex, SingleLabelIndex, build_classification_datasets
+from .standardization import standardize_feature_caches
 from .features import (
     PROJECT_ROOT,
     SPLITS,
@@ -108,7 +109,11 @@ def train_linear_probe(
     weight_decay: float,
     seed: int,
     run_args: dict[str, Any],
+    standardize: bool = False,
 ) -> dict[str, Any]:
+    standardizer = None
+    if standardize:
+        caches, standardizer = standardize_feature_caches(caches)
     train_features = caches["train"]["features"]
     train_labels = caches["train"]["labels"]
     feature_dim = int(train_features.shape[1])
@@ -209,6 +214,7 @@ def train_linear_probe(
                 best = {
                     "format_version": 1,
                     "classifier": copy.deepcopy(classifier.state_dict()),
+                    "standardizer": standardizer,
                     "feature_dim": feature_dim,
                     "num_classes": num_classes,
                     "class_names": class_names,
@@ -226,6 +232,7 @@ def train_linear_probe(
             best = {
                 "format_version": 1,
                 "classifier": copy.deepcopy(classifier.state_dict()),
+                "standardizer": standardizer,
                 "feature_dim": feature_dim,
                 "num_classes": num_classes,
                 "class_names": class_names,
@@ -258,6 +265,7 @@ def train_linear_probe(
     return {
         "best_epoch": best_epoch,
         "best_val": best["val_metrics"],
+        "standardization": "train_channel_zscore" if standardize else "none",
         "selection": selection,
         "validation_used": validation_used,
         "head_filename": None if best_path is None else best_path.name,
@@ -313,8 +321,12 @@ def train_multilabel_probe(
     weight_decay: float,
     seed: int,
     output: Path | None = None,
+    standardize: bool = False,
 ) -> dict[str, Any]:
     """Fit a fresh in-memory BABEL head and select it by validation mAP."""
+    standardizer = None
+    if standardize:
+        caches, standardizer = standardize_feature_caches(caches)
     train = caches["train"]
     validation = caches["val"]
     feature_dim = int(train["features"].shape[1])
@@ -374,6 +386,7 @@ def train_multilabel_probe(
             if output is not None:
                 _atomic_torch_save({
                     "classifier": classifier.state_dict(), "epoch": epoch,
+                    "standardizer": standardizer,
                     "val_metrics": metrics, "feature_dim": feature_dim,
                     "num_classes": num_classes,
                 }, output / "linear-probe-best.pth.tar")
@@ -388,6 +401,7 @@ def train_multilabel_probe(
     return {
         "best_epoch": best_epoch,
         "best_val": best_metrics,
+        "standardization": "train_channel_zscore" if standardize else "none",
         "selection": "validation_best",
         "validation_used": True,
         "test": None,
@@ -515,6 +529,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         weight_decay=args.weight_decay,
         seed=args.seed,
         run_args=_serializable_args(args),
+        standardize=bool(getattr(args, "standardize", True)),
     )
     dataset_metadata = json.loads((dataset_root / "meta.json").read_text(encoding="utf-8"))
     test_contents = dataset_metadata.get("test_contents", [])
@@ -578,6 +593,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--recompute-features", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=True,
+                        help="Standardize pooled channels using train features only")
     return parser
 
 

@@ -519,6 +519,8 @@ def _extract_token_features(
     device: torch.device,
     batch_size: int,
     num_workers: int,
+    use_bfloat16: bool = True,
+    show_progress: bool = True,
 ) -> dict[str, Any]:
     loader = DataLoader(
         dataset,
@@ -534,7 +536,7 @@ def _extract_token_features(
     sample_ids: list[str] = []
     with torch.inference_mode():
         for motion, fps, length, labels, ids in tqdm(
-            loader, desc="Extract JEPA tokens"
+            loader, desc="Extract JEPA tokens", disable=not show_progress
         ):
             motion = motion.to(device=device, dtype=torch.float32, non_blocking=True)
             fps = fps.to(device=device, dtype=torch.float32, non_blocking=True)
@@ -542,7 +544,7 @@ def _extract_token_features(
             active = _valid_frames(motion, length_device)
             amp_context = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if device.type == "cuda"
+                if device.type == "cuda" and use_bfloat16
                 else nullcontext()
             )
             with amp_context:

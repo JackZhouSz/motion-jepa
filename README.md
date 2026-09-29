@@ -146,6 +146,27 @@ The renderer automatically uses a timeline for 1D layouts and a
 time-by-joint/body-group grid for 2D layouts. Patch timelines annotate both
 token indices and their corresponding raw-frame spans.
 
+For 1D multiblock masks (including 1D patches), choose how context candidates
+are trimmed to the batch's minimum count:
+
+```yaml
+mask:
+  context_selection: random  # prefix (default) | random
+```
+
+`prefix` keeps the earliest remaining context tokens, matching the original
+implementation. `random` uniformly selects without replacement from each
+sample's remaining context candidates, then sorts their original time indices.
+Both modes keep the same context count and target masks for a given collator
+step; this option changes only context trimming. It does not change block
+sampling, target exclusion, or guarantee uniform coverage of the full timeline.
+2D masks do not use this minimum-count trimming; `random` is rejected for them.
+
+The mode is saved in mask checkpoint state for deterministic resume. Old
+checkpoints without this field are interpreted as `prefix`. Exact resume
+requires the same mode; switching modes requires a separate training experiment.
+The base and nmask2 configs explicitly retain `prefix`; select `random` to opt in.
+
 The active `random_spatial_segment` strategy samples four target masks. Each
 mask spans a contiguous 40–60% of the patch timeline and exactly four of the
 eight trajectory/body tokens. Targets may overlap, but their union is
@@ -154,8 +175,9 @@ mask experiments remain under `configs/_depr_experiments/`.
 
 ## Model variants
 
-`_1d` uses one token per 366-D frame and temporal transformer attention. Its
-context and target masks are contiguous temporal blocks.
+`_1d` uses one token per 366-D frame and temporal transformer attention. It
+samples contiguous temporal blocks; target exclusion and context trimming can
+leave a non-contiguous set of context tokens.
 
 Patchified `_2d` routes canonical root x/z and heading to a trajectory token,
 then appends the configured body groups. Coarse7 therefore produces a
@@ -274,6 +296,15 @@ ordinary cross-entropy and momentum SGD. Use `--overwrite` to rerun the head
 while retaining valid feature caches, or `--recompute-features` when the
 checkpoint, dataset index, statistics, or extraction setup has changed.
 
+Pooled-feature linear-probe commands and online probes now standardize each
+feature channel using **training features only**: `(x - train_mean) /
+max(train_std, 1e-6)`, with population standard deviation. Validation and test
+reuse those training statistics. Raw feature caches stay unchanged; saved
+offline heads include a `standardizer` containing the mean and scale required
+at inference. Use `--no-standardize` in the probe/LR-sweep CLI, or
+`linear_probe.standardize: false` online, to reproduce the previous protocol.
+This feature transformation is additional to BONES input-motion normalization.
+
 For the default validation-free dataset, the probe protocol is fixed in
 advance: 50 epochs, SGD with LR 0.3, momentum 0.9, zero weight decay, and cosine
 decay. Per-epoch training metrics are written to `metrics.csv`; the epoch-50
@@ -297,6 +328,7 @@ linear_probe:
   momentum: 0.9
   weight_decay: 0.0
   seed: 42
+  standardize: true
   # Use this for 2D encoders to retain spatial token identity:
   pooling: temporal_mean_spatial_flatten
 ```
@@ -322,6 +354,52 @@ test split. The best pretraining checkpoints are saved separately as
 `<write_tag>-best-babel-120-map.pth.tar`; probe results and both best scores
 resume from the latest checkpoint. The existing single-dataset `dataset_root`
 configuration continues to use the 100STYLE probe.
+
+Both `mjepa_patch_1d_base.yaml` and `mjepa_patch_1d_base_nmask2.yaml` also enable
+an attentive probe alongside the standardized linear probe:
+
+```yaml
+attentive_probe:
+  enabled: true
+  frequency: 10
+  # datasets defaults to linear_probe.datasets (BABEL-60 and BABEL-120).
+  epochs: 50
+  feature_batch_size: 256
+  batch_size: 256
+  num_workers: 8
+  lr: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 5
+  final_lr: 1.0e-6
+  gradient_clip: 1.0
+  num_heads: 6
+  seed: 42
+```
+
+The attentive head uses one learned query, one cross-attention block and a
+residual MLP (ratio 4, GELU), followed by LayerNorm and classification. It trains
+with AdamW (betas 0.9/0.999), warmup + cosine, and unweighted BCE. Inputs are
+unpooled frozen EMA tokens; padding is excluded, and motions with no valid token
+are rejected. It keeps the existing head's LayerNorm without adding the pooled
+linear probe's channel standardization. Tokens are held temporarily in CPU BF16
+memory, one dataset at a time; no token caches are written during pretraining.
+
+Both probe types run sequentially on rank 0, preserving the pretraining RNG.
+Attentive evaluation has its own frequency (defaulting to the linear frequency),
+and also runs before training and at the final epoch. Its metrics use
+`attentive_probe/babel-{60,120}/*`; its best pretraining checkpoints are
+`<write_tag>-best-attentive-babel-{60,120}-map.pth.tar`. Latest checkpoints store
+independent latest/best results for all four evaluations. Attentive probing can
+be disabled independently or enabled with its own BABEL `datasets` mapping.
+
+When resuming with a changed probe protocol (including raw → standardized
+linear features), the affected best scores are reset and that probe evaluates
+the resumed encoder before the next optimization step. Compatible probe scores
+are restored. TensorBoard's `feature_standardization` scalar marks the protocol;
+historical raw and standardized values should not be treated as one unchanged
+evaluation curve. A running process keeps its already-loaded configuration;
+these settings apply on the next launch/resume. Attentive probing adds full
+head-training time at each evaluation interval.
 
 Sweep every direct-child latest checkpoint with:
 

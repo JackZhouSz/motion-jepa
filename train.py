@@ -134,11 +134,14 @@ def _write_tensorboard_babel_probes(
     global_step: int,
     summaries: dict[str, dict],
     state: dict[str, dict],
+    probe_name: str = "linear_probe",
 ) -> None:
     if writer is None:
         return
     for name, summary in summaries.items():
-        prefix = f"linear_probe/{name}"
+        prefix = f"{probe_name}/{name}"
+        writer.add_scalar(f"{prefix}/feature_standardization",
+            float(summary.get("standardization") == "train_channel_zscore"), global_step)
         for metric, value in summary["best_val"].items():
             writer.add_scalar(f"{prefix}/val_{metric}", float(value), global_step)
         writer.add_scalar(
@@ -215,6 +218,42 @@ def _evaluate_online_probe_preserving_rng(evaluator, encoder) -> dict:
         restore_rng_state(rng_state)
 
 
+def _attentive_probe_args(config: dict) -> dict:
+    attentive = config.get("attentive_probe", {})
+    if not isinstance(attentive, dict):
+        raise ValueError("attentive_probe config must be a mapping")
+    linear = config.get("linear_probe", {})
+    if not isinstance(linear, dict):
+        raise ValueError("linear_probe config must be a mapping")
+    return {
+        "datasets": linear.get("datasets"),
+        "frequency": linear.get("frequency", config.get("logging", {}).get("checkpoint_freq", 50)),
+        **attentive,
+    }
+
+
+def _probe_protocols(config: dict, *, legacy: bool = False) -> dict:
+    """Identify comparable scores; frequency does not affect a fresh probe fit."""
+    shared = {key: config.get("data", {}).get(key) for key in
+              ("root_path", "stats_path", "num_frames", "motion_dim", "fps")}
+    shared["use_bfloat16"] = config.get("meta", {}).get("use_bfloat16", False)
+    common = dict(epochs=50, batch_size=256, feature_batch_size=256, seed=42)
+    defaults = {
+        "linear_probe": {**common, "lr": 0.3, "momentum": 0.9, "weight_decay": 0.0,
+                         "pooling": "valid_token_mean", "standardize": not legacy},
+        "attentive_probe": {**common, "lr": 3e-4, "weight_decay": 0.05,
+                            "warmup_epochs": 5, "final_lr": 1e-6,
+                            "gradient_clip": 1.0, "num_heads": 6},
+    }
+    protocols = {}
+    for kind, values in defaults.items():
+        options = _attentive_probe_args(config) if kind == "attentive_probe" else config.get(kind, {})
+        protocols[kind] = {**shared, **{key: options.get(key, value) for key, value in values.items()},
+                           "datasets": options.get("datasets"),
+                           "dataset_root": options.get("dataset_root", "dataset/100style-soma77-processed")}
+    return protocols
+
+
 def _evaluate_online_metrics_preserving_rng(evaluator, encoder, predictor) -> dict:
     rng_state = capture_rng_state()
     encoder_training = encoder.training
@@ -265,6 +304,7 @@ def _save_checkpoint(
     best_probe_val_top1: float = float("-inf"),
     best_probe_epoch: int | None = None,
     babel_probe_state: dict[str, dict] | None = None,
+    attentive_probe_state: dict[str, dict] | None = None,
     online_metrics_latest: dict | None = None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
@@ -292,6 +332,8 @@ def _save_checkpoint(
         "best_probe_val_top1": float(best_probe_val_top1),
         "best_probe_epoch": best_probe_epoch,
         "babel_probe_state": babel_probe_state,
+        "attentive_probe_state": attentive_probe_state,
+        "probe_protocols": _probe_protocols(config),
         "online_metrics_latest": online_metrics_latest,
     }
     if architecture is not None:
@@ -317,6 +359,8 @@ def _load_checkpoint(
     architecture: dict | None = None,
     linear_probe_state: dict | None = None,
     babel_probe_state: dict[str, dict] | None = None,
+    attentive_probe_state: dict[str, dict] | None = None,
+    probe_protocols: dict | None = None,
     online_metrics_state: dict | None = None,
 ) -> tuple[int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
@@ -361,6 +405,21 @@ def _load_checkpoint(
         saved = checkpoint.get("babel_probe_state") or {}
         for name, state in babel_probe_state.items():
             state.update(saved.get(name, {}))
+    if attentive_probe_state is not None:
+        saved = checkpoint.get("attentive_probe_state") or {}
+        for name, state in attentive_probe_state.items():
+            state.update(saved.get(name, {}))
+    if probe_protocols is not None:
+        saved_protocols = checkpoint.get("probe_protocols") or _probe_protocols(checkpoint["config"], legacy=True)
+        for kind, states in (("linear_probe", babel_probe_state), ("attentive_probe", attentive_probe_state)):
+            if saved_protocols.get(kind) == probe_protocols[kind]:
+                continue
+            logger.info("Resetting %s best scores: probe protocol changed", kind)
+            if states is not None:
+                for state in states.values():
+                    state.update(latest=None, best_val_map=float("-inf"), best_epoch=None)
+            if kind == "linear_probe" and linear_probe_state is not None:
+                linear_probe_state.update(latest=None, best_val_top1=float("-inf"), best_epoch=None)
     if online_metrics_state is not None:
         online_metrics_state["latest"] = checkpoint.get("online_metrics_latest")
     return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
@@ -368,6 +427,11 @@ def _load_checkpoint(
 
 def _build_mask_collator(args: dict, layout: TokenLayout):
     mask = args["mask"]
+    context_selection = str(mask.get("context_selection", "prefix"))
+    if context_selection not in ("prefix", "random"):
+        raise ValueError("mask.context_selection must be 'prefix' or 'random'")
+    if layout.kind != "1d" and context_selection != "prefix":
+        raise ValueError("mask.context_selection='random' requires a 1D multiblock mask")
     strategy = str(mask.get("strategy", "multiblock"))
     if strategy == "random_spatial_segment":
         if layout.kind != "2d" or not layout.patchified:
@@ -470,6 +534,7 @@ def _build_mask_collator(args: dict, layout: TokenLayout):
         allow_overlap=bool(mask["allow_overlap"]),
     )
     if layout.kind == "1d":
+        common["context_selection"] = context_selection
         if layout.patchified:
             return PatchMaskCollator1D(
                 raw_num_frames=layout.raw_num_frames,
@@ -523,13 +588,15 @@ def _seed_all(seed: int, device: torch.device) -> None:
 def main(args: dict, resume_preempt: bool = False, device=None):
     device = _resolve_device(device)
     probe_configuration = args.get("linear_probe", {})
+    attentive_args = _attentive_probe_args(args)
+    attentive_enabled = bool(attentive_args.get("enabled", False))
     babel_probe_requested = (
         isinstance(probe_configuration, dict)
         and bool(probe_configuration.get("enabled", False))
         and "datasets" in probe_configuration
     )
     distributed = init_distributed(
-        device, timeout_seconds=4 * 60 * 60 if babel_probe_requested else None
+        device, timeout_seconds=4 * 60 * 60 if (babel_probe_requested or attentive_enabled) else None
     )
     rank, world_size = distributed.rank, distributed.world_size
     if rank != 0:
@@ -559,6 +626,11 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     )
     if (probe_enabled or metrics_enabled) and probe_frequency <= 0:
         raise ValueError("linear_probe.frequency must be positive")
+    attentive_frequency = int(attentive_args["frequency"])
+    if attentive_enabled and attentive_frequency <= 0:
+        raise ValueError("attentive_probe.frequency must be positive")
+    if attentive_enabled and not isinstance(attentive_args.get("datasets"), dict):
+        raise ValueError("attentive_probe requires BABEL datasets (or linear_probe.datasets)")
     model_name = str(meta_args["model_name"])
     if model_name not in MODEL_FACTORIES:
         raise ValueError(f"Unknown MotionJEPA model_name: {model_name!r}")
@@ -647,6 +719,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         if babel_probe_enabled else None
     )
     online_metrics_state = {"latest": None}
+    attentive_probe_state = (
+        {name: {"latest": None, "best_val_map": float("-inf"), "best_epoch": None}
+         for name in ("babel-60", "babel-120")} if attentive_enabled else None
+    )
     latest_path = output / f"{log_args['write_tag']}-latest.pth.tar"
     best_accuracy_path = output / f"{log_args['write_tag']}-best-accuracy.pth.tar"
     should_load = resume_requested
@@ -672,6 +748,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             architecture=architecture,
             linear_probe_state=linear_probe_state,
             babel_probe_state=babel_probe_state,
+            attentive_probe_state=attentive_probe_state,
+            probe_protocols=_probe_protocols(args),
             online_metrics_state=online_metrics_state,
         )
         logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
@@ -713,6 +791,13 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         )
         tensorboard_writer = _make_tensorboard_writer(log_args, output, global_step)
 
+    online_attentive_probe = None
+    if attentive_enabled and distributed.is_main:
+        from experiment.linear_probe.online_attentive import OnlineAttentiveBabelProbes
+
+        online_attentive_probe = OnlineAttentiveBabelProbes(args, attentive_args, device=device)
+        logger.info("Enabled online attentive BABEL probes (epochs=%d, lr=%.3g, frequency=%d)",
+                    online_attentive_probe.epochs, online_attentive_probe.learning_rate, attentive_frequency)
     online_linear_probe = None
     if probe_enabled and distributed.is_main:
         if babel_probe_enabled:
@@ -772,6 +857,29 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     warmup = float(opt_args["warmup"])
     clip_grad = float(opt_args["clip_grad"]) if opt_args.get("clip_grad") is not None else None
 
+    def record_babel_probes(pretrain_epoch: int, summaries: dict, state: dict, kind: str) -> set[str]:
+        improved = set()
+        for name, summary in summaries.items():
+            score = float(summary["best_val"]["mean_average_precision"])
+            current = state[name]
+            current["latest"] = {"pretrain_epoch": pretrain_epoch, "global_step": global_step, **summary}
+            if score > float(current["best_val_map"]):
+                current.update(best_val_map=score, best_epoch=pretrain_epoch)
+                improved.add(name)
+            logger.info("epoch=%d %s %s val_mAP=%.4f best_val_mAP=%.4f best_epoch=%s",
+                        pretrain_epoch, kind, name, score, current["best_val_map"], current["best_epoch"])
+        _write_tensorboard_babel_probes(tensorboard_writer, global_step=global_step,
+            summaries=summaries, state=state, probe_name=kind)
+        return improved
+
+    def run_online_attentive_probe(pretrain_epoch: int) -> set[str]:
+        if not distributed.is_main:
+            return set()
+        if online_attentive_probe is None or attentive_probe_state is None:
+            raise RuntimeError("Online attentive probe was not initialized on rank 0")
+        summaries = _evaluate_online_probe_preserving_rng(online_attentive_probe, target_encoder)
+        return record_babel_probes(pretrain_epoch, summaries, attentive_probe_state, "attentive_probe")
+
     def run_online_linear_probe(pretrain_epoch: int) -> tuple[bool, set[str]]:
         if not distributed.is_main:
             return False, set()
@@ -782,32 +890,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         )
         if babel_probe_enabled:
             assert babel_probe_state is not None
-            improved_names = set()
-            for name, summary in probe_summary.items():
-                score = float(summary["best_val"]["mean_average_precision"])
-                state = babel_probe_state[name]
-                state["latest"] = {
-                    "pretrain_epoch": pretrain_epoch,
-                    "global_step": global_step,
-                    **summary,
-                }
-                if score > float(state["best_val_map"]):
-                    state["best_val_map"] = score
-                    state["best_epoch"] = pretrain_epoch
-                    improved_names.add(name)
-                logger.info(
-                    "epoch=%d linear_probe %s val_mAP=%.4f "
-                    "best_val_mAP=%.4f best_epoch=%s",
-                    pretrain_epoch, name, score,
-                    float(state["best_val_map"]), state["best_epoch"],
-                )
-            _write_tensorboard_babel_probes(
-                tensorboard_writer,
-                global_step=global_step,
-                summaries=probe_summary,
-                state=babel_probe_state,
-            )
-            return False, improved_names
+            return False, record_babel_probes(pretrain_epoch, probe_summary, babel_probe_state, "linear_probe")
         test_top1 = float(probe_summary["test"]["top1_accuracy"])
         linear_probe_state["latest"] = {
             "pretrain_epoch": pretrain_epoch,
@@ -883,11 +966,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             heldout["trajectory_ablation"]["trajectory_reliance"],
         )
 
-    # Establish a frozen-encoder baseline before the first optimization step.
-    # A resumed epoch-0 checkpoint already contains this result, so do not
-    # repeat the relatively expensive probe in that case.
+    # Establish a baseline for new or changed probe protocols. Compatible
+    # resumed results are retained without repeating the expensive evaluation.
     needs_initial_probe = (
-        probe_enabled and start_epoch == 0 and (
+        probe_enabled and (
             any(state["latest"] is None for state in babel_probe_state.values())
             if babel_probe_state is not None
             else linear_probe_state["latest"] is None
@@ -896,10 +978,16 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     needs_initial_metrics = (
         metrics_enabled and start_epoch == 0 and online_metrics_state["latest"] is None
     )
-    if needs_initial_probe or needs_initial_metrics:
+    needs_initial_attentive = attentive_enabled and any(
+        state["latest"] is None for state in attentive_probe_state.values()
+    )
+    if needs_initial_probe or needs_initial_metrics or needs_initial_attentive:
         initial_probe_improved, initial_babel_improved = (
-            run_online_linear_probe(pretrain_epoch=0)
+            run_online_linear_probe(pretrain_epoch=start_epoch)
             if needs_initial_probe else (False, set())
+        )
+        initial_attentive_improved = (
+            run_online_attentive_probe(pretrain_epoch=start_epoch) if needs_initial_attentive else set()
         )
         if needs_initial_metrics:
             run_online_representation_metrics(pretrain_epoch=0)
@@ -914,7 +1002,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             wd_scheduler=wd_scheduler,
             momentum_scheduler=momentum_scheduler,
             mask_collator=mask_collator,
-            next_epoch=0,
+            next_epoch=start_epoch,
             global_step=global_step,
             loss=float("nan"),
             world_size=world_size,
@@ -925,6 +1013,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
             best_probe_epoch=linear_probe_state["best_epoch"],
             babel_probe_state=babel_probe_state,
+            attentive_probe_state=attentive_probe_state,
             online_metrics_latest=online_metrics_state["latest"],
         )
         if distributed.is_main and initial_probe_improved:
@@ -935,6 +1024,9 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                     latest_path,
                     output / f"{log_args['write_tag']}-best-{name}-map.pth.tar",
                 )
+        if distributed.is_main:
+            for name in initial_attentive_improved:
+                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-attentive-{name}-map.pth.tar")
         barrier()
 
     # These meters span epoch boundaries and reset only after a log event, so
@@ -1071,6 +1163,11 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         babel_improved: set[str] = set()
         if should_probe and distributed.is_main:
             probe_improved, babel_improved = run_online_linear_probe(pretrain_epoch=epoch + 1)
+        attentive_improved: set[str] = set()
+        if attentive_enabled and distributed.is_main and (
+            (epoch + 1) % attentive_frequency == 0 or (epoch + 1) == epochs
+        ):
+            attentive_improved = run_online_attentive_probe(pretrain_epoch=epoch + 1)
         should_measure = metrics_enabled and (
             (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
         )
@@ -1099,6 +1196,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
             best_probe_epoch=linear_probe_state["best_epoch"],
             babel_probe_state=babel_probe_state,
+            attentive_probe_state=attentive_probe_state,
             online_metrics_latest=online_metrics_state["latest"],
         )
         if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
@@ -1115,6 +1213,9 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                     latest_path,
                     output / f"{log_args['write_tag']}-best-{name}-map.pth.tar",
                 )
+        if distributed.is_main:
+            for name in attentive_improved:
+                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-attentive-{name}-map.pth.tar")
         barrier()
         logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
 

@@ -18,7 +18,7 @@ patch:
   temporal_patch_size: 3
 
 logging:
-  folder: ./output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150-nmask2
+  folder: ./output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150-randomctx
   write_tag: motion-jepa-patch-1d-p3
   log_freq: 100
   tensorboard: true
@@ -59,10 +59,10 @@ attentive_probe:
   seed: 42
 
 mask:
-  context_selection: prefix  # prefix | random: how to trim context to the batch minimum
+  context_selection: random  # prefix | random: how to trim context to the batch minimum
   allow_overlap: false
   num_enc_masks: 1
-  num_pred_masks: 2
+  num_pred_masks: 4
   enc_frame_mask_ratio: [0.85, 1.0]
   pred_frame_mask_ratio: [0.15, 0.2]
 

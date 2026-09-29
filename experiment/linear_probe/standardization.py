@@ -30,3 +30,16 @@ class ChannelStandardizer:
         if not torch.isfinite(features).all():
             raise ValueError("Features must be finite")
         return (features.float() - self.mean.to(features.device)) / self.scale.to(features.device)
+
+
+def standardize_feature_caches(caches: dict) -> tuple[dict, dict]:
+    """Fit on train only, preserving labels/IDs and leaving raw caches untouched."""
+    scaler = ChannelStandardizer.fit(caches["train"]["features"])
+    transformed = {
+        split: {**cache, "features": scaler.transform(cache["features"])}
+        for split, cache in caches.items()
+    }
+    return transformed, {
+        "mean": scaler.mean, "scale": scaler.scale, "epsilon": scaler.epsilon,
+        "fit_split": "train", "correction": 0,
+    }

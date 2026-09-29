@@ -1,4 +1,4 @@
-"""In-memory 100STYLE and BABEL linear probing during pretraining."""
+"""Frozen-encoder classification probes during pretraining."""
 
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ class OnlineLinearProbe:
         self.weight_decay = float(probe_config.get("weight_decay", 0.0))
         self.seed = int(probe_config.get("seed", 42))
         self.pooling = str(probe_config.get("pooling", GLOBAL_MEAN_POOLING))
+        self.standardize = bool(probe_config.get("standardize", True))
         if min(self.epochs, self.feature_batch_size, self.batch_size) <= 0:
             raise ValueError("Linear-probe epochs and batch sizes must be positive")
         if self.num_workers < 0:
@@ -145,6 +146,7 @@ class OnlineLinearProbe:
                 "seed": self.seed,
                 "pooling": self.pooling,
             },
+            standardize=self.standardize,
         )
         if any(parameter.grad is not None for parameter in encoder.parameters()):
             raise RuntimeError("Online linear probe accumulated encoder gradients")
@@ -173,6 +175,7 @@ class OnlineBabelProbes:
         self.weight_decay = float(probe_config.get("weight_decay", 0.0))
         self.seed = int(probe_config.get("seed", 42))
         self.pooling = str(probe_config.get("pooling", GLOBAL_MEAN_POOLING))
+        self.standardize = bool(probe_config.get("standardize", True))
         if min(self.epochs, self.feature_batch_size, self.batch_size) <= 0:
             raise ValueError("Linear-probe epochs and batch sizes must be positive")
         if self.num_workers < 0:
@@ -239,6 +242,7 @@ class OnlineBabelProbes:
                 momentum=self.momentum,
                 weight_decay=self.weight_decay,
                 seed=self.seed,
+                standardize=self.standardize,
             )
             summary["dataset_root"] = str(self.dataset_roots[name])
             summary["pooling"] = self.pooling

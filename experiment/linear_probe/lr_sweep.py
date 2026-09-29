@@ -325,6 +325,7 @@ def _run_signature(
         "momentum": args.momentum,
         "weight_decay": args.weight_decay,
         "pooling": checkpoint_info.get("pooling", features.GLOBAL_MEAN_POOLING),
+        "standardize": bool(getattr(args, "standardize", True)),
     }
 
 
@@ -365,6 +366,7 @@ def run_one_probe(
         weight_decay=args.weight_decay,
         seed=seed,
         run_args=signature,
+        standardize=bool(getattr(args, "standardize", True)),
     )
     summary.update(
         {
@@ -613,6 +615,7 @@ def write_readme(
         f"- Optimizer: SGD, momentum {args.momentum}, weight decay {args.weight_decay}",
         "- Schedule: cosine decay; loss: ordinary cross entropy",
         f"- Pooling: `{getattr(args, 'pooling', features.GLOBAL_MEAN_POOLING)}`",
+        f"- Train-fitted channel standardization: {getattr(args, 'standardize', True)}",
         (
             "- Downstream comparisons select LR by validation top-1"
             if validation_used
@@ -856,6 +859,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "feature_batch_size": args.feature_batch_size,
+        "standardize": bool(getattr(args, "standardize", True)),
         "momentum": args.momentum,
         "weight_decay": args.weight_decay,
         "device": str(device),
@@ -933,6 +937,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--recompute-features", action="store_true")
     parser.add_argument("--overwrite-runs", action="store_true")
+    parser.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
 
