@@ -37,20 +37,23 @@ def _write_amass(path: Path, *, frames: int = 9, fps: float = 120.0, **extra) ->
     np.savez(path, **values)
 
 
-def test_amass_loading_uses_body_pose_and_exact_stride(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fps", [30.0, 60.0, 120.0, 119.6])
+def test_amass_loading_uses_body_pose_and_exact_stride(tmp_path: Path, fps: float) -> None:
     source = tmp_path / "motion_stageii.npz"
-    _write_amass(source)
+    _write_amass(source, fps=fps)
 
     sequence = load_amass_sequence(source)
 
-    assert sequence.source_fps == 120
-    assert sequence.source_fps_raw == 120.0
-    assert sequence.frame_step == 4
+    step = round_fps(fps) // 30
+    assert sequence.source_fps == round_fps(fps)
+    assert sequence.source_fps_raw == fps
+    assert sequence.frame_step == step
+    assert sequence.resampling_method == "fixed_step"
     assert sequence.source_num_frames == 9
-    assert sequence.poses.shape == (3, 72)
-    np.testing.assert_array_equal(sequence.poses[:, :66], np.load(source)["poses"][::4, :66])
+    assert sequence.poses.shape == ((9 + step - 1) // step, 72)
+    np.testing.assert_array_equal(sequence.poses[:, :66], np.load(source)["poses"][::step, :66])
     np.testing.assert_array_equal(sequence.poses[:, 66:], 0)
-    np.testing.assert_array_equal(sequence.trans, np.load(source)["trans"][::4])
+    np.testing.assert_array_equal(sequence.trans, np.load(source)["trans"][::step])
     assert sequence.source_gender == "female"
     assert sequence.surface_model_type == "smplx"
 
@@ -73,11 +76,60 @@ def test_fps_is_rounded_half_up(fps: float, expected: int) -> None:
     assert round_fps(fps) == expected
 
 
-def test_non_multiple_fps_is_discarded(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fps, frames", [(100.0, 11), (20.0, 3), (19.6, 3)])
+def test_non_multiple_fps_interpolates_translation_and_rotations(
+    tmp_path: Path, fps: float, frames: int,
+) -> None:
     source = tmp_path / "motion_stageii.npz"
-    _write_amass(source, fps=100.0)
-    with pytest.raises(DiscardSequence, match="not a multiple"):
-        load_amass_sequence(source)
+    poses = np.zeros((frames, 165), dtype=np.float32)
+    for joint in range(22):
+        poses[:, joint * 3 + joint % 3] = np.arange(frames) * 0.05
+    trans = np.arange(frames)[:, None] * np.array([[1., 2., -3.]])
+    _write_amass(source, frames=frames, fps=fps, poses=poses, trans=trans)
+    sequence = load_amass_sequence(source)
+    count = int(np.ceil(frames * 30 / round_fps(fps)))
+    coordinates = np.minimum(np.arange(count) * round_fps(fps) / 30, frames - 1)
+    assert sequence.frame_step is None
+    assert sequence.resampling_method == "lerp_slerp"
+    assert sequence.poses.shape == (count, 72)
+    assert sequence.poses.dtype == sequence.trans.dtype == np.float32
+    assert sequence.poses.flags.c_contiguous and sequence.trans.flags.c_contiguous
+    np.testing.assert_allclose(sequence.trans, coordinates[:, None] * [1, 2, -3], atol=1e-6)
+    for joint in range(22):
+        expected = np.zeros((count, 3))
+        expected[:, joint % 3] = coordinates * 0.05
+        np.testing.assert_allclose(sequence.poses[:, joint * 3:joint * 3 + 3], expected, atol=1e-6)
+    np.testing.assert_array_equal(sequence.poses[:, 66:], 0)
+
+
+def test_slerp_crosses_pi_by_shortest_path(tmp_path: Path) -> None:
+    source = tmp_path / "turn_stageii.npz"
+    poses = np.zeros((2, 165), dtype=np.float32)
+    poses[:, 2] = np.deg2rad([170., -170.])
+    _write_amass(source, frames=2, fps=20, poses=poses)
+    sequence = load_amass_sequence(source)
+    actual = Rotation.from_rotvec(sequence.poses[:, :3]).as_matrix()
+    expected = Rotation.from_euler(
+        "z", [[170.], [170. + 20 * 2 / 3], [190.]], degrees=True,
+    ).as_matrix()
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+    np.testing.assert_allclose(np.linalg.det(actual), 1, atol=1e-6)
+    np.testing.assert_array_equal(sequence.poses[:, 3:], 0)
+
+
+def test_interpolation_holds_single_frame(tmp_path: Path) -> None:
+    source = tmp_path / "still_stageii.npz"
+    _write_amass(source, frames=1, fps=20)
+    sequence = load_amass_sequence(source)
+    assert sequence.poses.shape == (2, 72)
+    np.testing.assert_array_equal(sequence.poses[0], sequence.poses[1])
+    np.testing.assert_array_equal(sequence.trans[0], sequence.trans[1])
+
+
+@pytest.mark.parametrize("fps", [0., -1., 0.1, np.nan, np.inf])
+def test_invalid_fps_is_discarded(fps: float) -> None:
+    with pytest.raises(DiscardSequence):
+        round_fps(fps)
 
 
 def test_discovery_excludes_stagei_and_preserves_limit(tmp_path: Path) -> None:

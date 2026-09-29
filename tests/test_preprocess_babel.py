@@ -198,3 +198,180 @@ def test_missing_conversion_is_skipped_with_label_count(tmp_path: Path) -> None:
     assert errors[0]["kind"] == "upstream_missing"
     assert errors[0]["skipped_label_rows"] == 1
     assert counts["upstream_missing_motions"] == 1
+
+
+def _resize_fixture(args: argparse.Namespace, frames: int, *, include_first: bool = True) -> None:
+    manifest_path = args.input_dir / "conversion_manifest.jsonl"
+    conversion = json.loads(manifest_path.read_text())
+    conversion["source_num_frames"] = frames * 4
+    conversion["output_num_frames"] = frames
+    manifest_path.write_text(json.dumps(conversion) + "\n")
+    _write_bvh(args.input_dir / conversion["output_relpath"], frames)
+    annotation_path = args.annotations_dir / "train.json"
+    annotation = json.loads(annotation_path.read_text())
+    item = annotation["1"]
+    item["dur"] = frames / 30
+    segment = item["frame_ann"]["labels"][0]
+    segment["end_t"] = frames / 30
+    annotation_path.write_text(json.dumps(annotation))
+    _write_labels(args.labels_dir / "train_label_60.pkl", [
+        (segment["seg_id"], label, 1, chunk, item["frame_ann"]["anntr_id"])
+        for chunk in ((0, 1) if include_first else (1,)) for label in (0, 1)
+    ])
+
+
+@pytest.mark.parametrize("tail,min_frames,kept", [(29, 30, False), (30, 30, True),
+    (31, 30, True), (15, 30, False), (29, 29, True), (30, 31, False),
+    (1, 1, True), (149, 150, False), (150, 150, True)])
+def test_minimum_chunk_length_filters_files_labels_and_stats(
+    tmp_path: Path, tail: int, min_frames: int, kept: bool,
+) -> None:
+    args = _write_fixture(tmp_path)
+    _resize_fixture(args, 150 + tail)
+    args.min_frames = min_frames
+    preprocess_babel.preprocess(args)
+    index = json.loads((args.output / "index.json").read_text())
+    meta = json.loads((args.output / "meta.json").read_text())
+    errors = [json.loads(line) for line in (args.output / "errors.jsonl").read_text().splitlines()]
+    assert len(index) == (4 if kept else 2)
+    assert len(list((args.output / "motions").rglob("*.npy"))) == (2 if kept else 1)
+    assert all(row["length"] >= min_frames for row in index)
+    assert meta["train_stats_frames"] == 2 * (150 + (tail if kept else 0))
+    assert meta["min_frames"] == min_frames
+    assert meta["num_skipped_label_rows"] == (0 if kept else 2)
+    expected = np.concatenate([np.load(args.output / row["motion_path"]) for row in index])
+    np.testing.assert_allclose(np.load(args.output / "stats/mean.npy"), expected.mean(axis=0, dtype=np.float64), atol=1e-6)
+    if not kept:
+        assert errors[0]["kind"] == "short_chunk"
+        assert errors[0]["valid_length"] == tail
+        assert errors[0]["skipped_label_rows"] == 2
+        assert errors[0]["min_frames"] == min_frames
+
+
+def test_short_chunk_after_clamping_to_bvh_is_skipped(tmp_path: Path) -> None:
+    args = _write_fixture(tmp_path)
+    _resize_fixture(args, 179)
+    path = args.annotations_dir / "train.json"
+    annotation = json.loads(path.read_text())
+    annotation["1"]["frame_ann"]["labels"][0]["end_t"] = 10.0
+    path.write_text(json.dumps(annotation))
+    preprocess_babel.preprocess(args)
+    assert len(json.loads((args.output / "index.json").read_text())) == 2
+    errors = [json.loads(line) for line in (args.output / "errors.jsonl").read_text().splitlines()]
+    assert errors[0]["valid_length"] == 29
+
+
+def test_all_short_training_chunks_fail_without_stats(tmp_path: Path) -> None:
+    args = _write_fixture(tmp_path)
+    _resize_fixture(args, 165, include_first=False)
+    with pytest.raises(RuntimeError, match="no BABEL training samples.*minimum is 30"):
+        preprocess_babel.preprocess(args)
+    assert not list(args.output.rglob("*.npy"))
+    error = json.loads((args.output / "errors.jsonl").read_text())
+    assert error["kind"] == "short_chunk"
+    assert error["valid_length"] == 15
+    assert error["skipped_label_rows"] == 2
+
+
+def test_subframe_segment_is_logged_as_empty_chunk(tmp_path: Path) -> None:
+    args = _write_fixture(tmp_path)
+    path = args.annotations_dir / "train.json"
+    annotation = json.loads(path.read_text())
+    item = annotation["1"]
+    item["frame_ann"]["labels"].append({
+        "seg_id": "short-segment", "start_t": 0.0, "end_t": 0.01,
+    })
+    path.write_text(json.dumps(annotation))
+    annotator = item["frame_ann"]["anntr_id"]
+    _write_labels(args.labels_dir / "train_label_60.pkl", [
+        (segment, label, 1, chunk, annotator)
+        for segment, chunk in ((item["frame_ann"]["labels"][0]["seg_id"], 1), ("short-segment", 0))
+        for label in (0, 1)
+    ])
+    preprocess_babel.preprocess(args)
+    assert len(json.loads((args.output / "index.json").read_text())) == 2
+    error = json.loads((args.output / "errors.jsonl").read_text())
+    assert error["kind"] == "empty_chunk"
+    assert error["valid_length"] == 0
+    assert error["skipped_label_rows"] == 2
+
+
+@pytest.mark.parametrize("method,fps,step", [(None, 120, 4), ("fixed_step", 60, 2),
+    ("lerp_slerp", 100, None), ("lerp_slerp", 20, None)])
+def test_legacy_and_new_manifest_policies(
+    tmp_path: Path, method: str | None, fps: int, step: int | None,
+) -> None:
+    args = _write_fixture(tmp_path)
+    path = args.input_dir / "conversion_manifest.jsonl"
+    manifest = json.loads(path.read_text())
+    manifest.update(source_fps=fps, source_fps_raw=float(fps), frame_step=step, source_num_frames=fps * 6)
+    if method is not None:
+        manifest["resampling_method"] = method
+    path.write_text(json.dumps(manifest) + "\n")
+    preprocess_babel.preprocess(args)
+    metadata = json.loads((args.output / "index.json").read_text())[0]["metadata"]
+    assert metadata["frame_step"] == step
+    assert metadata.get("resampling_method") == method
+
+
+@pytest.mark.parametrize("method,fps,step", [("unknown", 100, None),
+    ("lerp_slerp", 120, None), ("lerp_slerp", 100, 3), ("fixed_step", 100, 3)])
+def test_invalid_resampling_manifests_are_rejected(tmp_path: Path, method: str, fps: int, step: int | None) -> None:
+    args = _write_fixture(tmp_path)
+    path = args.input_dir / "conversion_manifest.jsonl"
+    manifest = json.loads(path.read_text())
+    manifest.update(resampling_method=method, source_fps=fps, frame_step=step)
+    path.write_text(json.dumps(manifest) + "\n")
+    with pytest.raises(RuntimeError, match="no BABEL training samples"):
+        preprocess_babel.preprocess(args)
+
+
+@pytest.mark.parametrize("change", ["min_frames", "version", "legacy", "manifest", "subset"])
+def test_complete_dataset_reuse_requires_matching_policy(tmp_path: Path, change: str) -> None:
+    args = _write_fixture(tmp_path)
+    preprocess_babel.preprocess(args)
+    index_path = args.output / "index.json"
+    original_mtime = index_path.stat().st_mtime_ns
+    preprocess_babel.preprocess(args)
+    assert index_path.stat().st_mtime_ns == original_mtime
+    if change == "min_frames":
+        args.min_frames = 31
+    elif change == "subset":
+        args.subset = 120
+    elif change == "manifest":
+        with args.manifest.open("a") as file:
+            file.write("\n")
+    else:
+        path = args.output / "meta.json"
+        meta = json.loads(path.read_text())
+        if change == "legacy":
+            del meta["preprocessing_version"]
+        else:
+            meta["preprocessing_version"] = -1
+        path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="new --output directory or explicit --overwrite"):
+        preprocess_babel.preprocess(args)
+    assert index_path.stat().st_mtime_ns == original_mtime
+
+
+def test_explicit_overwrite_applies_new_min_frames(tmp_path: Path) -> None:
+    args = _write_fixture(tmp_path)
+    _resize_fixture(args, 180)
+    preprocess_babel.preprocess(args)
+    args.min_frames = 31
+    args.overwrite = True
+    preprocess_babel.preprocess(args)
+    assert len(json.loads((args.output / "index.json").read_text())) == 2
+    assert json.loads((args.output / "meta.json").read_text())["min_frames"] == 31
+
+
+@pytest.mark.parametrize("minimum", [0, -1, 151])
+def test_invalid_min_frames_is_rejected(tmp_path: Path, minimum: int) -> None:
+    args = _write_fixture(tmp_path)
+    args.min_frames = minimum
+    with pytest.raises(ValueError, match="--min-frames must be between"):
+        preprocess_babel.preprocess(args)
+
+
+def test_min_frames_cli_default() -> None:
+    assert preprocess_babel.build_parser().parse_args(["--subset", "60"]).min_frames == 30

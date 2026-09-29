@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pickle
@@ -36,6 +37,7 @@ from skeleton import SOMASkeleton30, parse_bvh_motion  # noqa: E402
 
 FPS = 30
 NUM_FRAMES = 150
+PREPROCESSING_VERSION = 2
 DEFAULT_INPUT = PROJECT_ROOT / "dataset/amass_soma_bvh"
 DEFAULT_ANNOTATIONS = PROJECT_ROOT / "dataset/babel-annotation"
 DEFAULT_LABELS = PROJECT_ROOT / "dataset/babel-60-and-120"
@@ -59,6 +61,7 @@ _INPUT_DIR: Path | None = None
 _OUTPUT_ROOT: Path | None = None
 _TARGET_SKELETON: SOMASkeleton30 | None = None
 _THREAD_CONFIG_PID: int | None = None
+_MIN_FRAMES = FPS
 
 
 @dataclass(frozen=True)
@@ -340,8 +343,6 @@ def build_work_items(
                         f"invalid segment times for sid={sid}, segment={segment_id}"
                     )
                 start_frame, end_frame = int(FPS * start_t), int(FPS * end_t)
-                if end_frame <= start_frame:
-                    raise ValueError(f"empty segment after frame conversion for sid={sid}, segment={segment_id}")
                 key = (segment_id, chunk_n)
                 info = (start_frame, end_frame, start_t, end_t)
                 if key in chunk_info and chunk_info[key] != info:
@@ -376,10 +377,11 @@ def build_work_items(
     return works, skips, dict(counts)
 
 
-def _init_worker(input_dir: str, output_root: str) -> None:
-    global _INPUT_DIR, _OUTPUT_ROOT, _TARGET_SKELETON, _THREAD_CONFIG_PID
+def _init_worker(input_dir: str, output_root: str, min_frames: int = FPS) -> None:
+    global _INPUT_DIR, _OUTPUT_ROOT, _TARGET_SKELETON, _THREAD_CONFIG_PID, _MIN_FRAMES
     _INPUT_DIR = Path(input_dir)
     _OUTPUT_ROOT = Path(output_root)
+    _MIN_FRAMES = min_frames
     current_pid = os.getpid()
     if _THREAD_CONFIG_PID != current_pid:
         torch.set_num_threads(1)
@@ -411,6 +413,7 @@ def _conversion_metadata(conversion: dict[str, Any]) -> dict[str, Any]:
         "output_num_frames", "target_fps", "mean_vertex_error_m",
         "max_vertex_error_m", "motion_correction", "motion_correction_settings",
         "smpl_model_sha256", "skeleton_sha256", "target_identity",
+        "resampling_method",
     )
     return {key: conversion[key] for key in keys if key in conversion}
 
@@ -423,13 +426,24 @@ def _convert_one(work: SourceWork, class_names: tuple[str, ...]) -> dict[str, An
         conversion = work.conversion
         target_fps = int(conversion.get("target_fps", -1))
         source_fps = int(conversion.get("source_fps", -1))
-        frame_step = int(conversion.get("frame_step", -1))
+        frame_step = conversion.get("frame_step")
+        method = conversion.get("resampling_method", "fixed_step")
         if target_fps != FPS:
             raise ValueError(f"manifest target_fps must be {FPS}, got {target_fps}")
-        if source_fps <= 0 or source_fps % FPS or frame_step != source_fps // FPS:
-            raise ValueError(
-                f"invalid fixed-step manifest FPS: source={source_fps}, step={frame_step}"
-            )
+        if source_fps <= 0:
+            raise ValueError(f"manifest source_fps must be positive, got {source_fps}")
+        if method == "fixed_step":
+            if source_fps % FPS or frame_step != source_fps // FPS:
+                raise ValueError(
+                    f"invalid fixed-step manifest FPS: source={source_fps}, step={frame_step}"
+                )
+        elif method == "lerp_slerp":
+            if source_fps % FPS == 0 or frame_step is not None:
+                raise ValueError(
+                    f"invalid interpolation manifest FPS: source={source_fps}, step={frame_step}"
+                )
+        else:
+            raise ValueError(f"unknown resampling_method: {method!r}")
         rotations, roots, parsed_fps = parse_bvh_motion(_INPUT_DIR / work.bvh_relpath)
         if round_fps(float(parsed_fps)) != FPS:
             raise ValueError(f"SOMA BVH must be {FPS} FPS, got {parsed_fps}")
@@ -462,7 +476,24 @@ def _convert_one(work: SourceWork, class_names: tuple[str, ...]) -> dict[str, An
                     "feat_p": work.feat_p,
                     "segment_id": chunk.segment_id,
                     "chunk_n": chunk.chunk_n,
+                    "valid_length": max(0, end - start),
+                    "min_frames": _MIN_FRAMES,
                     "error": f"chunk [{start}, {end}) is outside BVH with {len(rotations)} frames",
+                    "skipped_label_rows": len(chunk.labels),
+                })
+                continue
+            if end - start < _MIN_FRAMES:
+                errors.append({
+                    "ok": False,
+                    "kind": "short_chunk",
+                    "split": work.split,
+                    "sid": work.sid,
+                    "feat_p": work.feat_p,
+                    "segment_id": chunk.segment_id,
+                    "chunk_n": chunk.chunk_n,
+                    "valid_length": end - start,
+                    "min_frames": _MIN_FRAMES,
+                    "error": f"chunk has {end - start} frames; minimum is {_MIN_FRAMES}",
                     "skipped_label_rows": len(chunk.labels),
                 })
                 continue
@@ -553,7 +584,7 @@ def _ordered_results(
 ) -> Iterator[dict[str, Any]]:
     if not works:
         return
-    init_args = (str(args.input_dir), str(args.output))
+    init_args = (str(args.input_dir), str(args.output), args.min_frames)
     workers = min(max(1, int(args.workers)), len(works))
     if workers == 1:
         _init_worker(*init_args)
@@ -577,6 +608,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("workers and chunksize must be positive")
     if args.limit is not None and args.limit <= 0:
         raise ValueError("limit must be positive")
+    if not 1 <= args.min_frames <= NUM_FRAMES:
+        raise ValueError(f"--min-frames must be between 1 and {NUM_FRAMES}")
 
 
 def preprocess(args: argparse.Namespace) -> None:
@@ -596,13 +629,31 @@ def preprocess(args: argparse.Namespace) -> None:
     args.num_frames = NUM_FRAMES
     args.overlap = 0.0
     args.split_seed = None
+    args.min_frames = getattr(args, "min_frames", FPS)
     _validate_args(args)
+    manifest_sha256 = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
+    reuse_metadata = {
+        "preprocessing_version": PREPROCESSING_VERSION,
+        "min_frames": args.min_frames,
+        "conversion_manifest_sha256": manifest_sha256,
+        "subset": args.subset,
+    }
     if (
         args.output.exists()
         and _validate_complete_dataset(args.output)
         and (args.output / "class-index.json").is_file()
         and not args.overwrite
     ):
+        existing_metadata = json.loads((args.output / "meta.json").read_text(encoding="utf-8"))
+        mismatches = [
+            key for key, value in reuse_metadata.items()
+            if existing_metadata.get(key) != value
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Existing BABEL dataset has incompatible metadata ({', '.join(mismatches)}); "
+                "use a new --output directory or explicit --overwrite"
+            )
         print(f"Reusing complete NPY dataset: {args.output}")
         return
     if not args.input_dir.is_dir():
@@ -645,6 +696,9 @@ def preprocess(args: argparse.Namespace) -> None:
             ))
             records_by_split[result["split"]].append(record)
     if not records_by_split["train"]:
+        with (args.output / "errors.jsonl").open("w", encoding="utf-8") as file:
+            for error in errors:
+                file.write(json.dumps(error, ensure_ascii=False) + "\n")
         first = errors[0].get("error", "no valid chunks") if errors else "no valid chunks"
         raise RuntimeError(f"no BABEL training samples were produced: {first}")
     all_ids: set[str] = set()
@@ -663,7 +717,7 @@ def preprocess(args: argparse.Namespace) -> None:
         source_dataset=f"BABEL-{args.subset}_fixed_identity_soma77",
         segmentation="official_babel_action_segments_150_frame_chunks",
         metadata_extra={
-            "subset": args.subset,
+            **reuse_metadata,
             "class_names": list(class_names),
             "num_classes": args.subset,
             "split_policy": "official_babel_train_val_test_empty",
@@ -671,7 +725,9 @@ def preprocess(args: argparse.Namespace) -> None:
             "source_standard_tpose": True,
             "source_rotations_already_tpose_relative": True,
             "resampled": False,
-            "downsampling": "performed_upstream_fixed_step_no_interpolation",
+            "downsampling": "performed_upstream_fixed_step_or_lerp_slerp",
+            "fps_validation": "positive_rounded_source_fps_target_30",
+            "resampling_stage": "amass_to_soma",
             "conversion_manifest": str(args.manifest),
             "conversion_errors": str(conversion_errors_path),
             "annotations_dir": str(args.annotations_dir),
@@ -717,6 +773,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--workers", type=int, default=min(32, os.cpu_count() or 1))
     parser.add_argument("--chunksize", type=int, default=8)
+    parser.add_argument(
+        "--min-frames", type=int, default=FPS,
+        help="Minimum valid frames per final 30 FPS chunk (1–150; default: 30).",
+    )
     parser.add_argument("--limit", type=int, help="Limit the number of joined source motions.")
     parser.add_argument("--overwrite", action="store_true")
     return parser

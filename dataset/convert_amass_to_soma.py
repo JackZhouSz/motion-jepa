@@ -26,7 +26,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -91,11 +91,12 @@ class AMASSSequence:
     trans: np.ndarray
     source_fps_raw: float
     source_fps: int
-    frame_step: int
+    frame_step: int | None
     source_num_frames: int
     source_betas: np.ndarray
     source_gender: str
     surface_model_type: str | None
+    resampling_method: str = "fixed_step"
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,10 @@ def round_fps(fps: float) -> int:
     value = float(fps)
     if not math.isfinite(value) or value <= 0:
         raise DiscardSequence(f"invalid source FPS: {fps!r}")
-    return int(math.floor(value + 0.5))
+    rounded = int(math.floor(value + 0.5))
+    if rounded <= 0:
+        raise DiscardSequence(f"source FPS rounds to zero: {fps!r}")
+    return rounded
 
 
 def _scalar_string(value: Any) -> str:
@@ -136,7 +140,7 @@ def _scalar_string(value: Any) -> str:
 
 
 def load_amass_sequence(path: str | Path) -> AMASSSequence:
-    """Load, validate, and stride-sample one AMASS stage-II file."""
+    """Load AMASS at 30 FPS, using exact strides or position/rotation interpolation."""
     path = Path(path)
     try:
         context = np.load(path, allow_pickle=True)
@@ -162,15 +166,41 @@ def load_amass_sequence(path: str | Path) -> AMASSSequence:
             raise ValueError(f"missing FPS metadata; expected one of {FPS_KEYS}")
         source_fps_raw = float(np.asarray(data[fps_key]).reshape(()))
         source_fps = round_fps(source_fps_raw)
-        if source_fps % TARGET_FPS:
-            raise DiscardSequence(
-                f"rounded source FPS {source_fps} is not a multiple of {TARGET_FPS}"
-            )
-        step = source_fps // TARGET_FPS
         poses = np.zeros((len(poses_full), 72), dtype=np.float32)
         poses[:, :66] = poses_full[:, :66]
-        poses = np.ascontiguousarray(poses[::step])
-        trans = np.ascontiguousarray(trans_full[::step], dtype=np.float32)
+        if source_fps % TARGET_FPS == 0:
+            step = source_fps // TARGET_FPS
+            method = "fixed_step"
+            poses = np.ascontiguousarray(poses[::step])
+            trans = np.ascontiguousarray(trans_full[::step], dtype=np.float32)
+        else:
+            step = None
+            method = "lerp_slerp"
+            count = (len(poses_full) * TARGET_FPS + source_fps - 1) // source_fps
+            # Preserve the T/F duration convention used by stride sampling.
+            # Upsampling can request a time beyond the final observation; hold it.
+            sample_frames = np.minimum(
+                np.arange(count, dtype=np.float64) * source_fps / TARGET_FPS,
+                len(poses_full) - 1,
+            )
+            left = np.floor(sample_frames).astype(np.int64)
+            right = np.minimum(left + 1, len(poses_full) - 1)
+            alpha = (sample_frames - left)[:, None]
+            trans = np.ascontiguousarray(
+                (1 - alpha) * trans_full[left] + alpha * trans_full[right],
+                dtype=np.float32,
+            )
+            interpolated = np.zeros((count, 72), dtype=np.float32)
+            if len(poses_full) == 1:
+                interpolated[:, :66] = poses[0, :66]
+            else:
+                source_frames = np.arange(len(poses_full), dtype=np.float64)
+                for joint in range(22):
+                    columns = slice(joint * 3, joint * 3 + 3)
+                    quaternions = Rotation.from_rotvec(poses[:, columns]).as_quat()
+                    rotations = Slerp(source_frames, Rotation.from_quat(quaternions))
+                    interpolated[:, columns] = rotations(sample_frames).as_rotvec()
+            poses = interpolated
         betas = (
             np.asarray(data["betas"], dtype=np.float32).reshape(-1).copy()
             if "betas" in data else np.empty(0, dtype=np.float32)
@@ -184,7 +214,7 @@ def load_amass_sequence(path: str | Path) -> AMASSSequence:
         )
     return AMASSSequence(
         poses, trans, source_fps_raw, source_fps, step, len(poses_full), betas, gender,
-        model_type,
+        model_type, method,
     )
 
 
@@ -669,6 +699,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "target_fps": TARGET_FPS,
                     "source_num_frames": sequence.source_num_frames,
                     "frame_step": sequence.frame_step,
+                    "resampling_method": sequence.resampling_method,
                     "output_num_frames": len(sequence.poses),
                     "source_betas": sequence.source_betas.tolist(),
                     "source_gender": sequence.source_gender,
