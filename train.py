@@ -9,6 +9,7 @@ import os
 import random
 import shutil
 import time
+import traceback
 from contextlib import nullcontext
 from pathlib import Path
 from tqdm import tqdm
@@ -113,8 +114,9 @@ def _write_tensorboard_linear_probe(
     if writer is None:
         return
     scalars = {
-        f"linear_probe/test_{name}": float(value)
-        for name, value in summary["test"].items()
+        f"linear_probe/test_{name}": float(summary["test"][name])
+        for name in ("loss", "top1_accuracy", "macro_accuracy", "top5_accuracy")
+        if name in summary["test"]
     }
     if summary.get("validation_used", True):
         scalars["linear_probe/val_top1_accuracy"] = float(
@@ -140,10 +142,11 @@ def _write_tensorboard_babel_probes(
         return
     for name, summary in summaries.items():
         prefix = f"{probe_name}/{name}"
-        writer.add_scalar(f"{prefix}/feature_standardization",
-            float(summary.get("standardization") == "train_channel_zscore"), global_step)
-        for metric, value in summary["best_val"].items():
-            writer.add_scalar(f"{prefix}/val_{metric}", float(value), global_step)
+        for metric in ("loss", "mean_average_precision", "top1_hit",
+                       "top1_label_row_accuracy", "top5_hit"):
+            if metric in summary["best_val"]:
+                writer.add_scalar(f"{prefix}/val_{metric}",
+                                  float(summary["best_val"][metric]), global_step)
         writer.add_scalar(
             f"{prefix}/best_val_mean_average_precision",
             float(state[name]["best_val_map"]), global_step,
@@ -176,8 +179,53 @@ def _write_tensorboard_online_metrics(
 ) -> None:
     if writer is None:
         return
-    for name, value in _flatten_numeric_metrics("online_metrics", summary).items():
-        writer.add_scalar(name, value, global_step)
+    if "retrieval" in summary:
+        from experiment.motion_online_metrics import tensorboard_metrics
+
+        scalars = tensorboard_metrics(summary)
+    else:
+        # Legacy 2D evaluator: numeric metadata is not a learning curve.
+        metric_names = {
+            "rankme", "mean_std", "mean_cosine", "mean_off_diagonal_cosine",
+            "effective_rank", "largest_eigenvalue_ratio", "off_diagonal_abs_mean",
+            "mse", "smooth_l1", "cosine_similarity", "prediction_gain",
+            "baseline_mse", "trajectory_reliance", "body_temporal_std",
+            "body_joint_std", "trajectory_temporal_std",
+        }
+        scalars = {
+            key: value for key, value in _flatten_numeric_metrics("", summary).items()
+            if key.rsplit("/", 1)[-1] in metric_names
+        }
+    for name, value in scalars.items():
+        writer.add_scalar(f"online_metrics/{name}", value, global_step)
+    if summary.get("overhead_percent") is not None:
+        writer.add_scalar("online_metrics/timing/overhead_percent",
+                          float(summary["overhead_percent"]), global_step)
+    writer.flush()
+
+
+def _write_tensorboard_segmentation_probe(writer, *, global_step, summary, state):
+    if writer is None:
+        return
+    for dataset in ("babel-120", "babel-60"):
+        for metric in ("frame_map", "bce", "micro_f1"):
+            value = summary["best_val"][dataset][metric]
+            if value is not None:
+                writer.add_scalar(f"segmentation_probe/{dataset}/val_{metric}",
+                                  float(value), global_step)
+    prefix = "segmentation_probe/babel-120"
+    writer.add_scalar(f"{prefix}/best_val_frame_map", float(state["best_val_map"]), global_step)
+    writer.add_scalar(f"{prefix}/probe_best_epoch", float(summary["best_epoch"]), global_step)
+    writer.add_scalar(f"{prefix}/pretrain_best_epoch", float(state["best_epoch"]), global_step)
+    timing_tags = {
+        "feature_extraction_or_cache_load_seconds": "feature_extraction_seconds",
+        "head_seconds": "head_training_seconds",
+        "evaluation_call_seconds": "total_seconds",
+    }
+    for key, tag in timing_tags.items():
+        if key in summary.get("timings", {}):
+            writer.add_scalar(f"segmentation_probe/timing/{tag}",
+                              float(summary["timings"][key]), global_step)
     writer.flush()
 
 
@@ -216,6 +264,38 @@ def _evaluate_online_probe_preserving_rng(evaluator, encoder) -> dict:
         return evaluator.evaluate(encoder)
     finally:
         restore_rng_state(rng_state)
+
+
+def _evaluate_frozen_encoder_preserving_rng(evaluator, encoder, **kwargs) -> dict:
+    """Fit heads or run inference without changing the pretraining state."""
+    rng_state = capture_rng_state()
+    modes = [(module, module.training) for module in encoder.modules()]
+    flags = [(parameter, parameter.requires_grad) for parameter in encoder.parameters()]
+    try:
+        encoder.eval()
+        for parameter, _ in flags:
+            parameter.requires_grad_(False)
+        return evaluator.evaluate(encoder, **kwargs)
+    finally:
+        for parameter, flag in flags:
+            parameter.requires_grad_(flag)
+        for module, mode in modes:
+            module.training = mode
+        restore_rng_state(rng_state)
+
+
+def _run_rank_zero(function, *, is_main: bool):
+    """Propagate rank-zero failures before other ranks enter later collectives."""
+    result = None
+    if is_main:
+        try:
+            result = {"value": function(), "error": None}
+        except Exception:
+            result = {"value": None, "error": traceback.format_exc()}
+    result = all_gather_objects(result)[0]
+    if result["error"] is not None:
+        raise RuntimeError(f"Rank-zero evaluation failed:\n{result['error']}")
+    return result["value"]
 
 
 def _attentive_probe_args(config: dict) -> dict:
@@ -281,6 +361,19 @@ def _atomic_copy(source: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
+def _upsert_epoch_jsonl(path: Path, summary: dict) -> None:
+    """Replace a retried evaluation without duplicating its learning-curve point."""
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+    key = (summary["pretrain_epoch"], summary.get("protocol_hash"))
+    records = [record for record in records
+               if (record["pretrain_epoch"], record.get("protocol_hash")) != key]
+    records.append(summary)
+    records.sort(key=lambda record: record["pretrain_epoch"])
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
+    os.replace(temporary, path)
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -306,6 +399,7 @@ def _save_checkpoint(
     babel_probe_state: dict[str, dict] | None = None,
     attentive_probe_state: dict[str, dict] | None = None,
     online_metrics_latest: dict | None = None,
+    segmentation_probe_state: dict | None = None,
 ) -> None:
     rng_states = all_gather_objects(capture_rng_state())
     mask_states = all_gather_objects(mask_collator.state_dict())
@@ -335,6 +429,7 @@ def _save_checkpoint(
         "attentive_probe_state": attentive_probe_state,
         "probe_protocols": _probe_protocols(config),
         "online_metrics_latest": online_metrics_latest,
+        "segmentation_probe_state": segmentation_probe_state,
     }
     if architecture is not None:
         payload["architecture"] = architecture
@@ -362,6 +457,7 @@ def _load_checkpoint(
     attentive_probe_state: dict[str, dict] | None = None,
     probe_protocols: dict | None = None,
     online_metrics_state: dict | None = None,
+    segmentation_probe_state: dict | None = None,
 ) -> tuple[int, int]:
     # Full training checkpoints contain trusted local Python/NumPy RNG state,
     # optimizer state, and scheduler state in addition to tensor weights.
@@ -422,6 +518,8 @@ def _load_checkpoint(
                 linear_probe_state.update(latest=None, best_val_top1=float("-inf"), best_epoch=None)
     if online_metrics_state is not None:
         online_metrics_state["latest"] = checkpoint.get("online_metrics_latest")
+    if segmentation_probe_state is not None:
+        segmentation_probe_state.update(checkpoint.get("segmentation_probe_state") or {})
     return int(checkpoint["next_epoch"]), int(checkpoint["global_step"])
 
 
@@ -590,13 +688,18 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     probe_configuration = args.get("linear_probe", {})
     attentive_args = _attentive_probe_args(args)
     attentive_enabled = bool(attentive_args.get("enabled", False))
+    segmentation_args = args.get("segmentation_probe", {})
+    if not isinstance(segmentation_args, dict):
+        raise ValueError("segmentation_probe config must be a mapping")
+    segmentation_enabled = bool(segmentation_args.get("enabled", False))
     babel_probe_requested = (
         isinstance(probe_configuration, dict)
         and bool(probe_configuration.get("enabled", False))
         and "datasets" in probe_configuration
     )
     distributed = init_distributed(
-        device, timeout_seconds=4 * 60 * 60 if (babel_probe_requested or attentive_enabled) else None
+        device, timeout_seconds=4 * 60 * 60
+        if (babel_probe_requested or attentive_enabled or segmentation_enabled) else None
     )
     rank, world_size = distributed.rank, distributed.world_size
     if rank != 0:
@@ -624,8 +727,17 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     probe_frequency = int(
         probe_args.get("frequency", log_args.get("checkpoint_freq", 50))
     )
-    if (probe_enabled or metrics_enabled) and probe_frequency <= 0:
+    if probe_enabled and probe_frequency <= 0:
         raise ValueError("linear_probe.frequency must be positive")
+    metrics_frequency = int(metric_args.get("frequency", probe_frequency))
+    if metrics_enabled and metrics_frequency <= 0:
+        raise ValueError("online_metrics.frequency must be positive")
+    metrics_kind = str(metric_args.get("kind", "legacy"))
+    if metrics_enabled and metrics_kind not in {"legacy", "motion"}:
+        raise ValueError("online_metrics.kind must be legacy or motion")
+    segmentation_frequency = int(segmentation_args.get("frequency", 30))
+    if segmentation_enabled and segmentation_frequency <= 0:
+        raise ValueError("segmentation_probe.frequency must be positive")
     attentive_frequency = int(attentive_args["frequency"])
     if attentive_enabled and attentive_frequency <= 0:
         raise ValueError("attentive_probe.frequency must be positive")
@@ -640,14 +752,19 @@ def main(args: dict, resume_preempt: bool = False, device=None):
 
     output = Path(log_args["folder"])
     resume_requested = bool(meta_args.get("load_checkpoint", False) or resume_preempt)
-    if output.exists() and not resume_requested:
-        raise FileExistsError(f"Output folder already exists: {output}")
-    if distributed.is_main:
+
+    def initialize_output():
+        # Check and create on the same rank: another rank may arrive after the
+        # directory has already been created by rank zero. Broadcast failures
+        # before anyone enters model/DDP initialization.
+        if output.exists() and not resume_requested:
+            raise FileExistsError(f"Output folder already exists: {output}")
         output.mkdir(parents=True, exist_ok=True)
         (output / "params-motion-jepa.yaml").write_text(
             yaml.safe_dump(args, sort_keys=False), encoding="utf-8"
         )
-    barrier()
+
+    _run_rank_zero(initialize_output, is_main=distributed.is_main)
 
     encoder, predictor = init_mjepa_model_from_config(args, device)
     layout = encoder.token_layout
@@ -719,6 +836,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         if babel_probe_enabled else None
     )
     online_metrics_state = {"latest": None}
+    segmentation_probe_state = {
+        "latest": None, "best_val_map": float("-inf"), "best_epoch": None,
+        "protocol_hash": None,
+    }
     attentive_probe_state = (
         {name: {"latest": None, "best_val_map": float("-inf"), "best_epoch": None}
          for name in ("babel-60", "babel-120")} if attentive_enabled else None
@@ -751,6 +872,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             attentive_probe_state=attentive_probe_state,
             probe_protocols=_probe_protocols(args),
             online_metrics_state=online_metrics_state,
+            segmentation_probe_state=segmentation_probe_state,
         )
         logger.info("Resumed %s at epoch=%d global_step=%d", load_path, start_epoch, global_step)
 
@@ -789,7 +911,12 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             ("%.7e", "weight_decay"),
             ("%.3f", "time_ms"),
         )
-        tensorboard_writer = _make_tensorboard_writer(log_args, output, global_step)
+        # A committed checkpoint already includes its evaluation at global_step.
+        # Purge only later, uncommitted events; compatible resume skips that
+        # completed evaluation and therefore will not write its scalar again.
+        tensorboard_writer = _make_tensorboard_writer(
+            log_args, output, global_step + 1 if should_load else global_step
+        )
 
     online_attentive_probe = None
     if attentive_enabled and distributed.is_main:
@@ -823,8 +950,46 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                 probe_frequency,
             )
 
+    online_segmentation_probe = None
+    if segmentation_enabled:
+        def initialize_segmentation():
+            nonlocal online_segmentation_probe
+            from experiment.segmentation_probe import OnlineSegmentationProbe
+
+            rng_state = capture_rng_state()
+            try:
+                online_segmentation_probe = OnlineSegmentationProbe(
+                    args, segmentation_args, device=device
+                )
+            finally:
+                restore_rng_state(rng_state)
+            return online_segmentation_probe.protocol_hash
+
+        protocol_hash = _run_rank_zero(initialize_segmentation, is_main=distributed.is_main)
+        if segmentation_probe_state["protocol_hash"] != protocol_hash:
+            segmentation_probe_state.update(latest=None, best_val_map=float("-inf"),
+                                            best_epoch=None, protocol_hash=protocol_hash)
+        logger.info("Enabled BABEL segmentation linear probe (frequency=%d)", segmentation_frequency)
+
     online_metrics = None
-    if metrics_enabled and distributed.is_main:
+    if metrics_enabled and metrics_kind == "motion":
+        def initialize_motion_metrics():
+            nonlocal online_metrics
+            from experiment.motion_online_metrics import MotionOnlineMetrics
+
+            rng_state = capture_rng_state()
+            try:
+                online_metrics = MotionOnlineMetrics(args, metric_args, device=device)
+            finally:
+                restore_rng_state(rng_state)
+            return online_metrics.protocol_hash
+
+        protocol_hash = _run_rank_zero(initialize_motion_metrics, is_main=distributed.is_main)
+        saved = online_metrics_state["latest"] or {}
+        if saved.get("protocol_hash") != protocol_hash:
+            online_metrics_state["latest"] = None
+        logger.info("Enabled online motion metrics (frequency=%d)", metrics_frequency)
+    elif metrics_enabled and distributed.is_main:
         from experiment.online_metrics import OnlineRepresentationMetrics
 
         online_metrics = OnlineRepresentationMetrics(
@@ -837,7 +1002,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             "Enabled online representation metrics on %d fixed validation samples "
             "(frequency=%d)",
             len(online_metrics.indices),
-            probe_frequency,
+            metrics_frequency,
         )
 
     use_bfloat16 = bool(meta_args.get("use_bfloat16", False))
@@ -936,25 +1101,75 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             )
         return improved, set()
 
-    def run_online_representation_metrics(pretrain_epoch: int) -> None:
-        if not distributed.is_main:
-            return
-        if online_metrics is None:
-            raise RuntimeError("Online representation metrics were not initialized")
-        summary = _evaluate_online_metrics_preserving_rng(
-            online_metrics, target_encoder, _unwrapped(predictor)
+    def run_online_segmentation_probe(pretrain_epoch: int) -> bool:
+        summary = _run_rank_zero(
+            lambda: _evaluate_frozen_encoder_preserving_rng(
+                online_segmentation_probe, target_encoder, pretrain_epoch=pretrain_epoch
+            ), is_main=distributed.is_main,
         )
+        summary = {**summary, "pretrain_epoch": int(pretrain_epoch),
+                   "global_step": int(global_step)}
+        score = float(summary["best_val"]["babel-120"]["frame_map"])
+        if not np.isfinite(score):
+            raise FloatingPointError("Segmentation probe returned non-finite validation mAP")
+        improved = score > segmentation_probe_state["best_val_map"]
+        segmentation_probe_state["latest"] = summary
+        if improved:
+            segmentation_probe_state.update(best_val_map=score, best_epoch=pretrain_epoch)
+        if distributed.is_main:
+            _write_tensorboard_segmentation_probe(
+                tensorboard_writer, global_step=global_step, summary=summary,
+                state=segmentation_probe_state,
+            )
+            _upsert_epoch_jsonl(output / "segmentation-probe.jsonl", summary)
+            logger.info("epoch=%d segmentation frame_mAP120=%.5f frame_mAP60=%s best_epoch=%s",
+                        pretrain_epoch, score, summary["best_val"]["babel-60"]["frame_map"],
+                        segmentation_probe_state["best_epoch"])
+        return improved
+
+    def run_online_representation_metrics(pretrain_epoch: int) -> None:
+        if metrics_kind == "motion":
+            summary = _run_rank_zero(
+                lambda: _evaluate_frozen_encoder_preserving_rng(online_metrics, target_encoder),
+                is_main=distributed.is_main,
+            )
+        else:
+            if not distributed.is_main:
+                return
+            if online_metrics is None:
+                raise RuntimeError("Online representation metrics were not initialized")
+            summary = _evaluate_online_metrics_preserving_rng(
+                online_metrics, target_encoder, _unwrapped(predictor)
+            )
         summary = {
             "pretrain_epoch": int(pretrain_epoch),
             "global_step": int(global_step),
             **summary,
         }
+        if metrics_kind == "motion" and distributed.is_main:
+            previous = online_metrics_state["latest"] or {}
+            previous_epoch = int(previous.get("pretrain_epoch", 0))
+            epoch_path = output / "training-epochs.jsonl"
+            epoch_records = ([json.loads(line) for line in epoch_path.read_text().splitlines()]
+                             if epoch_path.exists() else [])
+            training_seconds = sum(record["training_wall_seconds"] for record in epoch_records
+                                   if previous_epoch < record["pretrain_epoch"] <= pretrain_epoch)
+            summary["training_interval_seconds"] = training_seconds
+            summary["overhead_percent"] = (
+                100 * float(summary["elapsed_seconds"]) / training_seconds
+                if training_seconds > 0 else None
+            )
         online_metrics_state["latest"] = summary
+        if not distributed.is_main:
+            return
         _write_tensorboard_online_metrics(
             tensorboard_writer, global_step=global_step, summary=summary
         )
-        with (output / "online-metrics.jsonl").open("a", encoding="utf-8") as file:
-            file.write(json.dumps(summary, sort_keys=True) + "\n")
+        _upsert_epoch_jsonl(output / "online-metrics.jsonl", summary)
+        if metrics_kind == "motion":
+            logger.info("epoch=%d online_motion %s", pretrain_epoch,
+                        json.dumps(summary["retrieval"], sort_keys=True))
+            return
         heldout = summary["heldout_jepa"]
         logger.info(
             "epoch=%d online_metrics rankme=%.3f body_std=%.4g "
@@ -976,12 +1191,44 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         )
     )
     needs_initial_metrics = (
-        metrics_enabled and start_epoch == 0 and online_metrics_state["latest"] is None
+        metrics_enabled and online_metrics_state["latest"] is None
     )
     needs_initial_attentive = attentive_enabled and any(
         state["latest"] is None for state in attentive_probe_state.values()
     )
-    if needs_initial_probe or needs_initial_metrics or needs_initial_attentive:
+    needs_initial_segmentation = segmentation_enabled and segmentation_probe_state["latest"] is None
+    if needs_initial_probe or needs_initial_metrics or needs_initial_attentive or needs_initial_segmentation:
+        if not should_load:
+            # A baseline head can take many epochs. Persist the untouched
+            # pretraining state first so a failure can resume that head instead
+            # of leaving an existing output directory with no latest checkpoint.
+            # Every rank participates in the RNG/mask-state collectives.
+            _save_checkpoint(
+                latest_path,
+                encoder=encoder,
+                predictor=predictor,
+                target_encoder=target_encoder,
+                optimizer=optimizer,
+                scaler=scaler,
+                lr_scheduler=lr_scheduler,
+                wd_scheduler=wd_scheduler,
+                momentum_scheduler=momentum_scheduler,
+                mask_collator=mask_collator,
+                next_epoch=start_epoch,
+                global_step=global_step,
+                loss=float("nan"),
+                world_size=world_size,
+                rank=rank,
+                config=args,
+                architecture=architecture,
+                linear_probe_latest=linear_probe_state["latest"],
+                best_probe_val_top1=float(linear_probe_state["best_val_top1"]),
+                best_probe_epoch=linear_probe_state["best_epoch"],
+                babel_probe_state=babel_probe_state,
+                attentive_probe_state=attentive_probe_state,
+                online_metrics_latest=online_metrics_state["latest"],
+                segmentation_probe_state=segmentation_probe_state,
+            )
         initial_probe_improved, initial_babel_improved = (
             run_online_linear_probe(pretrain_epoch=start_epoch)
             if needs_initial_probe else (False, set())
@@ -989,8 +1236,12 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         initial_attentive_improved = (
             run_online_attentive_probe(pretrain_epoch=start_epoch) if needs_initial_attentive else set()
         )
+        initial_segmentation_improved = (
+            run_online_segmentation_probe(pretrain_epoch=start_epoch)
+            if needs_initial_segmentation else False
+        )
         if needs_initial_metrics:
-            run_online_representation_metrics(pretrain_epoch=0)
+            run_online_representation_metrics(pretrain_epoch=start_epoch)
         _save_checkpoint(
             latest_path,
             encoder=encoder,
@@ -1015,6 +1266,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             babel_probe_state=babel_probe_state,
             attentive_probe_state=attentive_probe_state,
             online_metrics_latest=online_metrics_state["latest"],
+            segmentation_probe_state=segmentation_probe_state,
         )
         if distributed.is_main and initial_probe_improved:
             _atomic_copy(latest_path, best_accuracy_path)
@@ -1027,6 +1279,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         if distributed.is_main:
             for name in initial_attentive_improved:
                 _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-attentive-{name}-map.pth.tar")
+            if initial_segmentation_improved:
+                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-segmentation-map.pth.tar")
+            if start_epoch == 0:
+                _atomic_copy(latest_path, output / "initial-checkpoint.pth.tar")
         barrier()
 
     # These meters span epoch boundaries and reset only after a log event, so
@@ -1036,6 +1292,7 @@ def main(args: dict, resume_preempt: bool = False, device=None):
     interval_lr_meter = AverageMeter()
     interval_wd_meter = AverageMeter()
     for epoch in range(start_epoch, epochs):
+        epoch_started = time.perf_counter()
         sampler.set_epoch(epoch)
         encoder.train()
         predictor.train()
@@ -1156,6 +1413,15 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             if not np.isfinite(reported_loss):
                 raise FloatingPointError(f"Non-finite loss at step {global_step}: {reported_loss}")
 
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        if distributed.is_main:
+            _upsert_epoch_jsonl(output / "training-epochs.jsonl", {
+                "pretrain_epoch": epoch + 1, "global_step": global_step,
+                "training_wall_seconds": time.perf_counter() - epoch_started,
+                "step_compute_seconds": time_meter.sum / 1000,
+                "loss": loss_meter.avg,
+            })
         should_probe = probe_enabled and (
             (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
         )
@@ -1168,10 +1434,15 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             (epoch + 1) % attentive_frequency == 0 or (epoch + 1) == epochs
         ):
             attentive_improved = run_online_attentive_probe(pretrain_epoch=epoch + 1)
+        segmentation_improved = False
+        if segmentation_enabled and (
+            (epoch + 1) % segmentation_frequency == 0 or (epoch + 1) == epochs
+        ):
+            segmentation_improved = run_online_segmentation_probe(pretrain_epoch=epoch + 1)
         should_measure = metrics_enabled and (
-            (epoch + 1) % probe_frequency == 0 or (epoch + 1) == epochs
+            (epoch + 1) % metrics_frequency == 0 or (epoch + 1) == epochs
         )
-        if should_measure and distributed.is_main:
+        if should_measure:
             run_online_representation_metrics(pretrain_epoch=epoch + 1)
 
         _save_checkpoint(
@@ -1198,8 +1469,9 @@ def main(args: dict, resume_preempt: bool = False, device=None):
             babel_probe_state=babel_probe_state,
             attentive_probe_state=attentive_probe_state,
             online_metrics_latest=online_metrics_state["latest"],
+            segmentation_probe_state=segmentation_probe_state,
         )
-        if distributed.is_main and (epoch + 1) % checkpoint_frequency == 0:
+        if distributed.is_main and ((epoch + 1) % checkpoint_frequency == 0 or (epoch + 1) == epochs):
             checkpoint_path = output / f"{log_args['write_tag']}-ep{epoch + 1}.pth.tar"
             # The latest checkpoint is already complete and atomically written.
             # Copy its bytes instead of loading arbitrary pickle content merely
@@ -1216,6 +1488,8 @@ def main(args: dict, resume_preempt: bool = False, device=None):
         if distributed.is_main:
             for name in attentive_improved:
                 _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-attentive-{name}-map.pth.tar")
+            if segmentation_improved:
+                _atomic_copy(latest_path, output / f"{log_args['write_tag']}-best-segmentation-map.pth.tar")
         barrier()
         logger.info("epoch=%d average_loss=%.6f", epoch + 1, loss_meter.avg)
 

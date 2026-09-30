@@ -18,23 +18,19 @@ patch:
   temporal_patch_size: 3
 
 logging:
-  folder: ./output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150-segmentation-20260930
+  folder: ./output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150-wd4e-2
   write_tag: motion-jepa-patch-1d-p3
   log_freq: 100
   tensorboard: true
   tensorboard_folder: tensorboard
-  checkpoint_freq: 30
+  checkpoint_freq: 100
 
 linear_probe:
-  enabled: false
-
-attentive_probe:
-  enabled: false
-
-segmentation_probe:
   enabled: true
-  frequency: 30
-  dataset_root: ./dataset/babel-segmentation-120-processed-nframes30-150
+  frequency: 10
+  datasets:
+    babel-60: ./dataset/babel-60-processed-nframes30-150
+    babel-120: ./dataset/babel-120-processed-nframes30-150
   epochs: 50
   feature_batch_size: 256
   batch_size: 256
@@ -43,19 +39,23 @@ segmentation_probe:
   momentum: 0.9
   weight_decay: 0.0
   seed: 42
+  pooling: valid_token_mean
   standardize: true
 
-online_metrics:
+attentive_probe:
   enabled: true
-  kind: motion
   frequency: 10
-  num_queries: 128
-  num_gallery: 512
-  retrieval_gallery_size: 512
-  past_frames: 60
-  horizons_seconds: [0.5, 1.0, 2.0]
-  batch_size: 128
-  calibration_samples: 512
+  # Reuse linear_probe.datasets. Frozen tokens keep the head's LayerNorm.
+  epochs: 50
+  feature_batch_size: 256
+  batch_size: 256
+  num_workers: 8
+  lr: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 5
+  final_lr: 1.0e-6
+  gradient_clip: 1.0
+  num_heads: 6
   seed: 42
 
 mask:
@@ -79,7 +79,7 @@ optimization:
   ema: [0.996, 1.0]
   epochs: 300
   final_lr: 1.0e-6
-  final_weight_decay: 0.4
+  final_weight_decay: 0.04
   ipe_scale: 1.0
   lr: 0.0005
   start_lr: 0.0001

@@ -60,6 +60,7 @@ class GPUTrainingSmokeTest(unittest.TestCase):
                     "seed": 0,
                     "load_checkpoint": False,
                     "model_name": "mot_tiny_1d",
+                    "predictor_name": "mot_predictor_tiny_1d",
                     "pred_depth": 1,
                     "pred_emb_dim": 12,
                     "use_bfloat16": True,
