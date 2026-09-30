@@ -281,6 +281,8 @@ class MotionJEPADatasetViewer:
         port: int = 6006,
         mesh: bool = False,
         normalized: bool = False,
+        entries: list[MotionEntry] | None = None,
+        label: str = "MotionJEPA Dataset Viewer",
     ):
         try:
             import viser
@@ -291,7 +293,11 @@ class MotionJEPADatasetViewer:
         self.fps = read_dataset_fps(root)
         self.normalized = normalized
         self.stats_root = root / "stats" if root.is_dir() else None
-        self.entries = discover_entries(root, split, limit)
+        self.entries = discover_entries(root, split, limit) if entries is None else list(entries)
+        if entries is not None and limit > 0:
+            self.entries = self.entries[:limit]
+        if not self.entries:
+            raise FileNotFoundError(f"No MotionJEPA samples found under {root}")
         self.initial_index = max(0, min(sample_index, len(self.entries) - 1))
         if sample_id is not None:
             matches = [index for index, entry in enumerate(self.entries) if entry.id == sample_id]
@@ -305,7 +311,7 @@ class MotionJEPADatasetViewer:
         self.server = viser.ViserServer(
             host=host,
             port=port,
-            label="MotionJEPA Dataset Viewer",
+            label=label,
             enable_camera_keyboard_controls=False,
         )
         self.server.scene.world_axes.visible = False
