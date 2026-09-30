@@ -14,8 +14,8 @@ conda activate motion-jepa
 python -m pip install -r experiment/tmr/requirements.txt
 ```
 
-The requirements add Transformers 5.1 and its dependencies, including a compatible
-Hugging Face Hub version below 2. Existing PyTorch/CUDA packages remain in place.
+The requirements add Transformers 5.1, TensorBoard, and a compatible Hugging Face
+Hub version below 2. Existing PyTorch/CUDA packages remain in place.
 
 ## Model
 
@@ -43,6 +43,16 @@ the spatial axis is averaged and time is retained. `target_encoder` is the defau
 checkpoint key; `--checkpoint-key encoder` is also supported. Valid-frame masks
 are converted using the checkpoint token layout, excluding incomplete temporal
 patches. An input with zero valid JEPA tokens is rejected.
+
+JEPA tokens are standardized per channel using the mean and population standard
+deviation of **all valid tokens in the captioned training split**. Longer clips
+contribute more tokens; padding and excluded clips contribute none. Validation
+and test use exactly these training statistics. Preparation computes moments in
+FP64 in bounded chunks and saves FP32 `jepa/stats/mean.npy`, `std.npy`, and
+`complete.json` under the cache root. Normalization is applied in FP32 when loading
+tokens, using `(x - mean) / max(std, 1e-6)` before batch padding; the cached BF16
+features retain the original encoder outputs. This is separate from `--stats-path`,
+which supplies the raw-input statistics used before the JEPA encoder.
 
 ## BONES captions and caches
 
@@ -168,6 +178,34 @@ contain alignment heads, optimizer/scheduler, and RNG/loader states, without
 backbone weights. Resume an interrupted run by repeating its original command
 with `--resume`; model, optimization (including planned epochs), and feature
 provenance must match. A new experiment needs a new output directory.
+
+TensorBoard is enabled by default and writes to `<output-root>/tensorboard`.
+It records each optimizer step's loss and learning rate, epoch loss/sample count/
+duration, all validation retrieval metrics, the best validation score/epoch, and
+the selected checkpoint's test retrieval metrics. Scalars use optimizer steps
+as their horizontal axis. `--resume` keeps committed events and purges events
+after the saved step. Writers flush each epoch and close on completion or errors.
+Use `--tensorboard-dir PATH` for another directory or `--no-tensorboard` to disable.
+
+```bash
+tensorboard --logdir output/tmr --port 6007
+```
+
+JEPA preparation automatically computes the training feature statistics. Existing
+format-2 JEPA caches also gain them on the first training/evaluation load without
+extracting any backbone features again. To compute them separately on an existing
+cache, use:
+
+```bash
+python -m experiment.tmr.prepare_stats --cache-root "$TMR_CACHE"
+```
+
+The statistics manifest fingerprints training tokens, offsets, and mean/std;
+checkpoints retain this provenance. Changed statistics cannot silently resume or
+evaluate an existing run. Use `prepare_stats --recompute` to repair statistics;
+if the underlying features changed, start a new training run. JEPA checkpoints
+trained before this normalization was added require a new run. Raw checkpoints
+remain compatible.
 
 ```bash
 python -m experiment.tmr.evaluate \

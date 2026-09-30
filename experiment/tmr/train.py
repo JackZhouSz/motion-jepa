@@ -150,6 +150,22 @@ def _write_metrics(history: list[dict[str, Any]], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _tensorboard_writer(args, output: Path, global_step: int):
+    if not args.tensorboard:
+        return nullcontext(None)
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as error:
+        raise RuntimeError(
+            "TensorBoard logging requires tensorboard; install it in motion-jepa with "
+            "python -m pip install -r experiment/tmr/requirements.txt, or use --no-tensorboard"
+        ) from error
+    directory = Path(args.tensorboard_dir or output / "tensorboard").expanduser().resolve()
+    # The saved checkpoint includes evaluation at global_step. Discard only later
+    # events from uncommitted optimizer steps when resuming an interrupted run.
+    return SummaryWriter(log_dir=str(directory), purge_step=global_step + 1 if args.resume else None)
+
+
 def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
     checkpoint = _torch_load_checkpoint(path)
     if checkpoint.get("format_version") != 1 or checkpoint.get("experiment") != "tmr_alignment":
@@ -237,94 +253,114 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "device": str(device), "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
     }, output / "runtime.json")
     _write_metrics(history, output / "metrics.csv")
-    loader = DataLoader(
-        datasets["train"], batch_size=args.batch_size, shuffle=True,
-        generator=generator, num_workers=args.num_workers, collate_fn=collate_pairs,
-        # Recreate worker iterators each epoch so their generator consumption is
-        # identical after an epoch-boundary resume, including with workers > 0.
-        pin_memory=device.type == "cuda",
-    )
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        weighted_loss, sample_count, started = 0.0, 0, time.monotonic()
-        learning_rate = float(optimizer.param_groups[0]["lr"])
-        for batch in loader:
-            count = len(batch["caption_ids"])
-            if count < 2:
-                continue  # A singleton has no negative and contributes zero contrastive signal.
-            optimizer.zero_grad(set_to_none=True)
-            with _autocast(device, args.use_bfloat16):
-                motion, text = model(
-                    batch["motion_tokens"].to(device, non_blocking=True),
-                    batch["motion_mask"].to(device, non_blocking=True),
-                    batch["text_tokens"].to(device, non_blocking=True),
-                    batch["text_mask"].to(device, non_blocking=True),
-                )
-                loss = symmetric_multi_positive_info_nce(
-                    motion, text, batch["caption_ids"], batch["source_ids"],
-                    batch["start_frames"], batch["end_frames"], temperature=args.temperature,
-                    caption_candidate_ids=batch["caption_candidate_ids"],
-                )
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite TMR loss at epoch {epoch + 1}, step {global_step}")
-            loss.backward()
-            if args.gradient_clip:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip, error_if_nonfinite=True)
-            optimizer.step()
-            global_step += 1
-            weighted_loss += float(loss.detach()) * count
-            sample_count += count
-        if not sample_count:
-            raise ValueError("No trainable contrastive batches; at least two pairs are required")
-        validation = evaluate_split(
-            model, datasets["val"], device, batch_size=args.eval_batch_size,
+    with _tensorboard_writer(args, output, global_step) as writer:
+        loader = DataLoader(
+            datasets["train"], batch_size=args.batch_size, shuffle=True,
+            generator=generator, num_workers=args.num_workers, collate_fn=collate_pairs,
+            # Recreate worker iterators each epoch so their generator consumption is
+            # identical after an epoch-boundary resume, including with workers > 0.
+            pin_memory=device.type == "cuda",
+        )
+        for epoch in range(start_epoch, args.epochs):
+            model.train()
+            weighted_loss, sample_count, started = 0.0, 0, time.monotonic()
+            learning_rate = float(optimizer.param_groups[0]["lr"])
+            for batch in loader:
+                count = len(batch["caption_ids"])
+                if count < 2:
+                    continue  # A singleton has no negative and contributes zero contrastive signal.
+                optimizer.zero_grad(set_to_none=True)
+                with _autocast(device, args.use_bfloat16):
+                    motion, text = model(
+                        batch["motion_tokens"].to(device, non_blocking=True),
+                        batch["motion_mask"].to(device, non_blocking=True),
+                        batch["text_tokens"].to(device, non_blocking=True),
+                        batch["text_mask"].to(device, non_blocking=True),
+                    )
+                    loss = symmetric_multi_positive_info_nce(
+                        motion, text, batch["caption_ids"], batch["source_ids"],
+                        batch["start_frames"], batch["end_frames"], temperature=args.temperature,
+                        caption_candidate_ids=batch["caption_candidate_ids"],
+                    )
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Non-finite TMR loss at epoch {epoch + 1}, step {global_step}")
+                loss.backward()
+                if args.gradient_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip, error_if_nonfinite=True)
+                optimizer.step()
+                global_step += 1
+                loss_value = float(loss.detach())
+                if writer is not None:
+                    writer.add_scalar("train/loss", loss_value, global_step)
+                    writer.add_scalar("train/learning_rate", learning_rate, global_step)
+                weighted_loss += loss_value * count
+                sample_count += count
+            if not sample_count:
+                raise ValueError("No trainable contrastive batches; at least two pairs are required")
+            validation = evaluate_split(
+                model, datasets["val"], device, batch_size=args.eval_batch_size,
+                num_workers=args.num_workers, use_bfloat16=args.use_bfloat16, chunk_size=args.chunk_size,
+            )
+            row = {
+                "epoch": epoch + 1, "lr": learning_rate, "train_loss": weighted_loss / sample_count,
+                "train_samples": sample_count, **{f"val_{key}": value for key, value in validation.items()},
+            }
+            history.append(row)
+            improved = validation["mean_r1"] > best_score
+            if improved:
+                best_epoch, best_score = epoch + 1, float(validation["mean_r1"])
+            if writer is not None:
+                writer.add_scalar("train/epoch", epoch + 1, global_step)
+                writer.add_scalar("train/epoch_loss", row["train_loss"], global_step)
+                writer.add_scalar("train/epoch_samples", sample_count, global_step)
+                writer.add_scalar("train/epoch_seconds", time.monotonic() - started, global_step)
+                for key, value in validation.items():
+                    writer.add_scalar(f"val/{key}", value, global_step)
+                writer.add_scalar("val/best_mean_r1", best_score, global_step)
+                writer.add_scalar("val/best_epoch", best_epoch, global_step)
+            scheduler.step()
+            checkpoint = {
+                "format_version": 1, "experiment": "tmr_alignment", "config": config,
+                "provenance": provenance, "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                "next_epoch": epoch + 1, "global_step": global_step,
+                "best_epoch": best_epoch, "best_val_mean_r1": best_score,
+                "history": history, "rng_state": _capture_rng(generator, device),
+            }
+            _write_metrics(history, output / "metrics.csv")
+            if improved:
+                _atomic_torch_save(checkpoint, best_path)
+            _atomic_torch_save(checkpoint, latest_path)
+            if writer is not None:
+                writer.flush()
+            print(
+                f"TMR {args.input_source} epoch {epoch + 1}/{args.epochs}: "
+                f"loss={row['train_loss']:.5f}, val mean R@1={best_score:.4f} "
+                f"(current={validation['mean_r1']:.4f}), {time.monotonic() - started:.1f}s",
+                flush=True,
+            )
+        selected = load_alignment_checkpoint(best_path)
+        if selected["config"] != config or selected["provenance"] != provenance:
+            raise ValueError("Best checkpoint does not belong to this TMR run")
+        model.load_state_dict(selected["model"], strict=True)
+        test = evaluate_split(
+            model, datasets["test"], device, batch_size=args.eval_batch_size,
             num_workers=args.num_workers, use_bfloat16=args.use_bfloat16, chunk_size=args.chunk_size,
-        )
-        row = {
-            "epoch": epoch + 1, "lr": learning_rate, "train_loss": weighted_loss / sample_count,
-            "train_samples": sample_count, **{f"val_{key}": value for key, value in validation.items()},
+        ) if len(datasets["test"]) else None
+        if writer is not None and test is not None:
+            for key, value in test.items():
+                writer.add_scalar(f"test/{key}", value, global_step)
+        summary = {
+            "input_source": args.input_source, "output_root": str(output),
+            "selection": "mean_bidirectional_val_r1", "best_epoch": best_epoch,
+            "best_val": {key.removeprefix("val_"): value for key, value in history[best_epoch - 1].items() if key.startswith("val_")},
+            "test": test, "epochs_completed": len(history), "global_step": global_step,
+            "trainable_parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "best_checkpoint": str(best_path), "latest_checkpoint": str(latest_path),
+            "tensorboard_dir": str(Path(args.tensorboard_dir or output / "tensorboard").expanduser().resolve()) if args.tensorboard else None,
         }
-        history.append(row)
-        improved = validation["mean_r1"] > best_score
-        if improved:
-            best_epoch, best_score = epoch + 1, float(validation["mean_r1"])
-        scheduler.step()
-        checkpoint = {
-            "format_version": 1, "experiment": "tmr_alignment", "config": config,
-            "provenance": provenance, "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-            "next_epoch": epoch + 1, "global_step": global_step,
-            "best_epoch": best_epoch, "best_val_mean_r1": best_score,
-            "history": history, "rng_state": _capture_rng(generator, device),
-        }
-        _write_metrics(history, output / "metrics.csv")
-        if improved:
-            _atomic_torch_save(checkpoint, best_path)
-        _atomic_torch_save(checkpoint, latest_path)
-        print(
-            f"TMR {args.input_source} epoch {epoch + 1}/{args.epochs}: "
-            f"loss={row['train_loss']:.5f}, val mean R@1={best_score:.4f} "
-            f"(current={validation['mean_r1']:.4f}), {time.monotonic() - started:.1f}s",
-            flush=True,
-        )
-    selected = load_alignment_checkpoint(best_path)
-    if selected["config"] != config or selected["provenance"] != provenance:
-        raise ValueError("Best checkpoint does not belong to this TMR run")
-    model.load_state_dict(selected["model"], strict=True)
-    test = evaluate_split(
-        model, datasets["test"], device, batch_size=args.eval_batch_size,
-        num_workers=args.num_workers, use_bfloat16=args.use_bfloat16, chunk_size=args.chunk_size,
-    ) if len(datasets["test"]) else None
-    summary = {
-        "input_source": args.input_source, "output_root": str(output),
-        "selection": "mean_bidirectional_val_r1", "best_epoch": best_epoch,
-        "best_val": {key.removeprefix("val_"): value for key, value in history[best_epoch - 1].items() if key.startswith("val_")},
-        "test": test, "epochs_completed": len(history), "global_step": global_step,
-        "trainable_parameters": sum(parameter.numel() for parameter in model.parameters()),
-        "best_checkpoint": str(best_path), "latest_checkpoint": str(latest_path),
-    }
-    _atomic_json_save(summary, output / "summary.json")
-    return summary
+        _atomic_json_save(summary, output / "summary.json")
+        return summary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -359,6 +395,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--use-bfloat16", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--tensorboard-dir", type=Path)
     parser.add_argument("--resume", action="store_true")
     return parser
 

@@ -201,6 +201,23 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
             if metric.endswith(("_r1", "_r5", "_r10")):
                 self.assertGreaterEqual(summary["test"][metric], 0.0)
                 self.assertLessEqual(summary["test"][metric], 1.0)
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+        self.assertEqual(summary["tensorboard_dir"], str(output / "tensorboard"))
+        events = EventAccumulator(str(output / "tensorboard"), size_guidance={"scalars": 0}).Reload()
+        loss_events = events.Scalars("train/loss")
+        self.assertEqual([event.step for event in loss_events], list(range(1, latest["global_step"] + 1)))
+        self.assertTrue(all(event.value >= 0 for event in loss_events))
+        self.assertEqual(len(events.Scalars("train/learning_rate")), latest["global_step"])
+        self.assertEqual(len(events.Scalars("train/epoch_loss")), 2)
+        for row, event in zip(rows, events.Scalars("train/epoch_loss")):
+            self.assertAlmostEqual(event.value, float(row["train_loss"]), places=6)
+        for key, value in summary["test"].items():
+            event = events.Scalars(f"test/{key}")[-1]
+            self.assertEqual(event.step, latest["global_step"])
+            self.assertAlmostEqual(event.value, value, places=6)
+        for key in ("t2m_r1", "m2t_r1", "mean_r1"):
+            self.assertEqual(len(events.Scalars(f"val/{key}")), 2)
         return latest
 
     def _assert_deterministic_resume(
@@ -233,6 +250,13 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
             resumed_output / "latest.pth.tar", map_location="cpu", weights_only=False
         )
         self.assertEqual(interrupted["next_epoch"], 1)
+        # Emulate logs written after the last committed checkpoint. Resume must
+        # purge these orphan events while keeping that checkpoint's evaluation.
+        from torch.utils.tensorboard import SummaryWriter
+
+        with SummaryWriter(log_dir=str(resumed_output / "tensorboard")) as writer:
+            writer.add_scalar("train/loss", -999, interrupted["global_step"] + 1)
+            writer.add_scalar("val/mean_r1", -999, interrupted["global_step"] + 1)
         resumed_summary = train.run(self._training_args(
             root, annotations, resumed_output, resume=True, num_workers=num_workers
         ))
@@ -318,6 +342,14 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
                 ))
                 self.assertEqual(jepa_summary["input_source"], "jepa")
                 saved_jepa = self._assert_completed_run(jepa_output, jepa_summary)
+                self.assertIn("jepa_feature_stats", saved_jepa["provenance"])
+
+                quiet_output = root / "no-tensorboard"
+                quiet_args = self._training_args(root, annotations, quiet_output)
+                quiet_args.tensorboard = False
+                quiet_summary = train.run(quiet_args)
+                self.assertIsNone(quiet_summary["tensorboard_dir"])
+                self.assertFalse((quiet_output / "tensorboard").exists())
 
                 model = TextMotionAlignment(AlignmentConfig(**saved_jepa["config"]["model"]))
                 model.load_state_dict(saved_jepa["model"])
@@ -338,6 +370,19 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
                         "--num-workers", "0", "--chunk-size", "2",
                     ])
                     self.assertEqual(evaluate.run(evaluation_args), summary["test"])
+
+                # A head trained on unnormalized JEPA tokens must not silently
+                # evaluate against the newly standardized feature distribution.
+                legacy = dict(saved_jepa)
+                legacy["provenance"] = dict(saved_jepa["provenance"])
+                legacy["provenance"].pop("jepa_feature_stats")
+                legacy_path = root / "legacy-jepa.pth.tar"
+                torch.save(legacy, legacy_path)
+                legacy_args = evaluate.build_parser().parse_args([
+                    "--checkpoint", str(legacy_path), "--split", "test", "--device", "cpu",
+                ])
+                with self.assertRaisesRegex(ValueError, "provenance differs"):
+                    evaluate.run(legacy_args)
 
             self.assertEqual(_file_hash(root / "tiny-text/model.safetensors"), text_hash)
             self.assertEqual(_file_hash(root / "jepa.pth.tar"), jepa_hash)

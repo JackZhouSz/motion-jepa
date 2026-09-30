@@ -26,6 +26,7 @@ from .dataset import (
     DEFAULT_TEXT_MODEL, SPLITS, PreparedPairDataset, RaggedTokenBank,
     build_paired_index, json_digest,
 )
+from .normalization import ensure_feature_statistics
 
 
 CACHE_FORMAT_VERSION = 2
@@ -343,9 +344,39 @@ def prepare_caches(
     }
     directory = cache / input_source
     directory.mkdir(parents=True, exist_ok=True)
+    if input_source == "jepa":
+        _, _, metadata["jepa_feature_stats"] = _jepa_statistics(
+            cache, paired, metadata, recompute=recompute_features,
+        )
     _atomic_json_save(paired, directory / "paired-index.json")
     _atomic_json_save(metadata, directory / "prepared.json")
     return metadata
+
+
+def _jepa_statistics(cache, paired, metadata, *, recompute=False):
+    stats = {key: metadata[key] for key in ("stats_root", "stats_mean_sha256", "stats_std_sha256")}
+    bank = RaggedTokenBank(cache / "jepa/train", _motion_signature(paired, stats, metadata["jepa_source"]))
+    keys = [record["sample_id"] for record in paired["records"] if record["split"] == "train"]
+    if bank.keys != keys:
+        raise ValueError("JEPA statistics must use exactly the captioned training samples")
+    return ensure_feature_statistics(bank, recompute=recompute)
+
+
+def prepare_jepa_statistics(cache_root=DEFAULT_CACHE_ROOT, *, recompute=False):
+    """Upgrade a completed JEPA cache without loading either frozen backbone."""
+    cache = Path(cache_root).expanduser().resolve()
+    marker = cache / "jepa/prepared.json"
+    metadata = json.loads(marker.read_text())
+    if metadata.get("format_version") != CACHE_FORMAT_VERSION or metadata.get("input_source") != "jepa":
+        raise ValueError("JEPA statistics require a completed format-2 JEPA cache")
+    paired = json.loads((cache / "jepa/paired-index.json").read_text())
+    for key in ("paired_index_sha256", "catalog_sha256", "provenance", "split_counts", "filtered_counts"):
+        if paired[key] != metadata[key]:
+            raise ValueError("Prepared JEPA paired index is stale; run prepare_cache")
+    _, _, stats = _jepa_statistics(cache, paired, metadata, recompute=recompute)
+    metadata["jepa_feature_stats"] = stats
+    _atomic_json_save(metadata, marker)
+    return stats
 
 
 def load_prepared_datasets(
@@ -387,6 +418,17 @@ def load_prepared_datasets(
         checkpoint = Path(jepa_checkpoint or source["checkpoint_path"]).expanduser().resolve()
         if _sha256_file(checkpoint) != source["checkpoint_sha256"] or checkpoint_key != source["checkpoint_key"]:
             raise ValueError("JEPA checkpoint cache is stale; use --recompute-features")
+    motion_banks = {}
+    if input_source == "jepa":
+        for split in SPLITS:
+            motion_banks[split] = RaggedTokenBank(cache / "jepa" / split, _motion_signature(paired, stats, source))
+        mean, std, feature_stats = _jepa_statistics(cache, paired, metadata)
+        if "jepa_feature_stats" in metadata and metadata["jepa_feature_stats"] != feature_stats:
+            raise ValueError("Prepared JEPA feature statistics are stale; run prepare_stats --recompute")
+        if "jepa_feature_stats" not in metadata:
+            # Existing format-2 features can gain train-only statistics without re-extraction.
+            metadata["jepa_feature_stats"] = feature_stats
+            _atomic_json_save(metadata, marker)
     datasets = {}
     for split in SPLITS:
         records = [record for record in paired["records"] if record["split"] == split]
@@ -396,9 +438,11 @@ def load_prepared_datasets(
                 sample_captions=split == "train",
             )
         else:
-            bank = RaggedTokenBank(cache / "jepa" / split, _motion_signature(paired, stats, source))
-            datasets[split] = PreparedPairDataset(records, text_bank, motion_bank=bank, sample_captions=split == "train")
+            datasets[split] = PreparedPairDataset(
+                records, text_bank, motion_bank=motion_banks[split], sample_captions=split == "train",
+                motion_mean=mean, motion_std=std,
+            )
     return datasets, metadata
 
 
-__all__ = ["prepare_caches", "load_prepared_datasets", "load_text_backbone", "write_ragged_bank"]
+__all__ = ["prepare_caches", "prepare_jepa_statistics", "load_prepared_datasets", "load_text_backbone", "write_ragged_bank"]

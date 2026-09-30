@@ -191,12 +191,27 @@ class RaggedTokenBank:
 
 
 class PreparedPairDataset(Dataset):
-    def __init__(self, records, text_bank, *, motion_bank=None, raw_dataset=None, sample_captions=False):
+    def __init__(
+        self, records, text_bank, *, motion_bank=None, raw_dataset=None,
+        sample_captions=False, motion_mean=None, motion_std=None,
+    ):
         self.records = records
         self.text_bank = text_bank
         self.motion_bank = motion_bank
         self.raw_dataset = raw_dataset
         self.sample_captions = sample_captions
+        if (motion_mean is None) != (motion_std is None):
+            raise ValueError("Motion normalization requires both mean and std")
+        self.motion_mean = motion_mean
+        self.motion_std = motion_std
+        if motion_mean is not None:
+            dim = int(motion_bank.metadata["feature_dim"]) if motion_bank is not None else None
+            if (
+                motion_mean.shape != (dim,) or motion_std.shape != (dim,)
+                or not torch.isfinite(motion_mean).all() or not torch.isfinite(motion_std).all()
+                or (motion_std <= 0).any()
+            ):
+                raise ValueError("Motion normalization must match the JEPA feature channels")
         self.sample_ids = [record["sample_id"] for record in records]
         self.caption_ids = [record["caption_id"] for record in records]
         self.caption_candidates = [record["caption_ids"] for record in records]
@@ -232,6 +247,8 @@ class PreparedPairDataset(Dataset):
         caption_id = candidates[selected]
         if self.motion_bank is not None:
             motion = self.motion_bank[record["sample_id"]]
+            if self.motion_mean is not None:
+                motion = (motion - self.motion_mean) / self.motion_std
         else:
             values, _, length = self.raw_dataset[self.raw_rows[record["sample_id"]]]
             motion = torch.from_numpy(values[:length].copy())

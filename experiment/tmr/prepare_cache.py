@@ -33,9 +33,12 @@ def build_parser():
 
 def main(argv=None):
     metadata = prepare_caches(**vars(build_parser().parse_args(argv)))
-    print(json.dumps({key: metadata[key] for key in (
+    summary = {key: metadata[key] for key in (
         "input_source", "motion_dim", "text_dim", "split_counts", "filtered_counts"
-    )}, indent=2))
+    )}
+    if "jepa_feature_stats" in metadata:
+        summary["jepa_feature_stats"] = metadata["jepa_feature_stats"]
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

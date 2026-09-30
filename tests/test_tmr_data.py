@@ -235,6 +235,8 @@ class TMRDataTests(unittest.TestCase):
             cache = Path(temporary) / "cache"
             checkpoint = Path(temporary) / "jepa.pth"
             checkpoint.write_bytes(b"fake weights")
+            np.save(root / "motions/val/val-0.npy", np.full((4, 3), 8, dtype=np.float32))
+            np.save(root / "motions/test/test-0.npy", np.full((4, 3), 12, dtype=np.float32))
             encoder = _SpatialEncoder()
             info = {
                 "num_frames": 4, "fps": 2, "motion_dim": 3, "feature_dim": 3,
@@ -247,12 +249,28 @@ class TMRDataTests(unittest.TestCase):
                     stats_path=root / "stats", text_model="fake", device="cpu",
                 )
             with patch("experiment.tmr.features.load_frozen_encoder", side_effect=AssertionError):
-                datasets, _ = load_prepared_datasets(
+                datasets, metadata = load_prepared_datasets(
                     root, annotations, cache, "jepa", checkpoint,
                     stats_path=root / "stats", text_model="fake",
                 )
-            self.assertTrue(torch.equal(datasets["train"][0]["motion_tokens"], torch.full((2, 3), 3.0)))
+            self.assertTrue(torch.equal(datasets["train"].motion_bank["train-0"], torch.full((2, 3), 3.0)))
             self.assertEqual(len(datasets["train"][1]["motion_tokens"]), 1)
+            # Three valid train tokens (3, 3, 3.5), excluding padding and the
+            # captionless train tail. Validation/test have different means.
+            mean, std = 19 / 6, np.sqrt(1 / 18)
+            np.testing.assert_allclose(np.load(cache / "jepa/stats/mean.npy"), mean)
+            np.testing.assert_allclose(np.load(cache / "jepa/stats/std.npy"), std)
+            self.assertEqual(metadata["jepa_feature_stats"]["num_tokens"], 3)
+            for split, value in (("train", 3), ("val", 5), ("test", 7)):
+                torch.testing.assert_close(
+                    datasets[split][0]["motion_tokens"],
+                    torch.full((2, 3), (value - mean) / std),
+                )
+            tokens = torch.cat([datasets["train"][i]["motion_tokens"] for i in range(2)])
+            torch.testing.assert_close(tokens.mean(0), torch.zeros(3), atol=1e-6, rtol=0)
+            torch.testing.assert_close(tokens.std(0, correction=0), torch.ones(3))
+            batch = collate_pairs([datasets["train"][0], datasets["train"][1]])
+            self.assertTrue((batch["motion_tokens"][1, 1:] == 0).all())
             checkpoint.write_bytes(b"modified weights")
             with self.assertRaisesRegex(ValueError, "stale"):
                 load_prepared_datasets(root, annotations, cache, "jepa", checkpoint, text_model="fake")

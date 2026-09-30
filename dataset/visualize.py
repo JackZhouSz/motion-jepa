@@ -80,7 +80,8 @@ class ProcessedDatasetViewer:
             raise ValueError("Processed motion paths must be unique.")
         self.entry_by_label = dict(zip(self.labels, self.entries))
         self.sessions: dict[int, ViewerSession] = {}
-        self.lock = threading.Lock()
+        # Programmatic slider changes synchronously invoke their callbacks.
+        self.lock = threading.RLock()
         self.closed = False
 
         self.server = viser.ViserServer(
@@ -93,7 +94,8 @@ class ProcessedDatasetViewer:
         self.server.scene.set_up_direction("+y")
         self.server.on_client_connect(self._on_connect)
         self.server.on_client_disconnect(self._on_disconnect)
-        threading.Thread(target=self._playback_loop, daemon=True).start()
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
 
     def _load(self, session: ViewerSession, label: str) -> None:
         entry = self.entry_by_label[label]
@@ -104,8 +106,11 @@ class ProcessedDatasetViewer:
             stats_root=self.stats_root,
         )
         with self.lock:
-            if session.renderer is not None:
-                session.renderer.clear()
+            session.playing = False
+            previous_renderer = session.renderer
+            session.renderer = None
+            if previous_renderer is not None:
+                previous_renderer.clear()
             session.renderer = MotionRenderer(
                 session.client,
                 motion,
@@ -119,10 +124,9 @@ class ProcessedDatasetViewer:
                 ),
             )
             session.fps = fps
-            session.playing = False
             session.next_frame_time = time.monotonic()
             if session.gui:
-                session.renderer.mesh.opacity = float(session.gui["opacity"].value)
+                session.renderer.set_mesh_opacity(float(session.gui["opacity"].value))
                 session.gui["frame"].max = max(0, session.renderer.length - 1)
                 session.gui["frame"].value = 0
                 session.gui["fps"].value = fps
@@ -181,11 +185,12 @@ class ProcessedDatasetViewer:
         self._load(session, dropdown.value)
 
         def set_frame(value: int) -> None:
-            if session.renderer is None:
-                return
-            session.renderer.set_frame(value, show_contacts=bool(contacts.value))
-            if frame.value != session.renderer.frame:
-                frame.value = session.renderer.frame
+            with self.lock:
+                if session.renderer is None:
+                    return
+                session.renderer.set_frame(value, show_contacts=bool(contacts.value))
+                if frame.value != session.renderer.frame:
+                    frame.value = session.renderer.frame
 
         @dropdown.on_update
         def _(_event: Any) -> None:
@@ -197,38 +202,45 @@ class ProcessedDatasetViewer:
 
         @play.on_click
         def _(_event: Any) -> None:
-            session.playing = not session.playing
-            session.next_frame_time = time.monotonic()
+            with self.lock:
+                session.playing = not session.playing
+                session.next_frame_time = time.monotonic()
 
         @previous.on_click
         def _(_event: Any) -> None:
-            session.playing = False
-            set_frame(int(frame.value) - 1)
+            with self.lock:
+                session.playing = False
+                set_frame(int(frame.value) - 1)
 
         @next_.on_click
         def _(_event: Any) -> None:
-            session.playing = False
-            set_frame(int(frame.value) + 1)
+            with self.lock:
+                session.playing = False
+                set_frame(int(frame.value) + 1)
 
         @speed.on_click
         def _(_event: Any) -> None:
-            session.speed = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}[speed.value]
+            with self.lock:
+                session.speed = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}[speed.value]
 
         @mesh.on_update
         def _(_event: Any) -> None:
-            if session.renderer is not None:
-                session.renderer.mesh.visible = bool(mesh.value)
+            with self.lock:
+                if session.renderer is not None:
+                    session.renderer.set_mesh_visible(bool(mesh.value))
 
         @opacity.on_update
         def _(_event: Any) -> None:
-            if session.renderer is not None:
-                session.renderer.mesh.opacity = float(opacity.value)
+            with self.lock:
+                if session.renderer is not None:
+                    session.renderer.set_mesh_opacity(float(opacity.value))
 
         @skeleton.on_update
         def _(_event: Any) -> None:
-            if session.renderer is not None:
-                session.renderer.joints.visible = bool(skeleton.value)
-                session.renderer.bones.visible = bool(skeleton.value)
+            with self.lock:
+                if session.renderer is not None:
+                    session.renderer.joints.visible = bool(skeleton.value)
+                    session.renderer.bones.visible = bool(skeleton.value)
 
         @contacts.on_update
         def _(_event: Any) -> None:
@@ -236,10 +248,16 @@ class ProcessedDatasetViewer:
 
     def _on_disconnect(self, client: Any) -> None:
         with self.lock:
-            self.sessions.pop(client.client_id, None)
+            session = self.sessions.pop(client.client_id, None)
+            if session is not None:
+                session.playing = False
+                session.renderer = None
 
     def close(self) -> None:
-        self.closed = True
+        with self.lock:
+            self.closed = True
+        if threading.current_thread() is not self._playback_thread:
+            self._playback_thread.join(timeout=1.0)
 
     def _playback_loop(self) -> None:
         while not self.closed:
@@ -249,6 +267,8 @@ class ProcessedDatasetViewer:
             for session in sessions:
                 with self.lock:
                     renderer = session.renderer
+                    if self.closed:
+                        return
                     if (
                         renderer is None
                         or not session.playing

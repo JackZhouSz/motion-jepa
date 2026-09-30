@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -140,6 +141,7 @@ class TMRVisualizationTest(unittest.TestCase):
         _, entries = load_cached_entries(self.cache)
         viewer = TMRDatasetViewer.__new__(TMRDatasetViewer)
         viewer.entries, viewer.fps, viewer.split = entries, 60, "train"
+        viewer.lock = threading.RLock()
         viewer.normalized, viewer.stats_root, viewer.default_mesh = False, None, False
         gui = {
             "info": SimpleNamespace(content=""), "caption": SimpleNamespace(content=""),

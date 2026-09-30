@@ -306,7 +306,8 @@ class MotionJEPADatasetViewer:
             self.initial_index = matches[0]
         self.default_mesh = mesh
         self.sessions: dict[int, ViewerSession] = {}
-        self.lock = threading.Lock()
+        # Viser invokes callbacks synchronously for programmatic GUI updates.
+        self.lock = threading.RLock()
         self.closed = False
         self.server = viser.ViserServer(
             host=host,
@@ -318,7 +319,8 @@ class MotionJEPADatasetViewer:
         self.server.scene.set_up_direction("+y")
         self.server.on_client_connect(self._on_connect)
         self.server.on_client_disconnect(self._on_disconnect)
-        threading.Thread(target=self._playback_loop, daemon=True).start()
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
 
     def _load_entry(self, session: ViewerSession, index: int) -> None:
         entry = self.entries[index]
@@ -328,24 +330,27 @@ class MotionJEPADatasetViewer:
             normalized=self.normalized,
             stats_root=self.stats_root,
         )
-        if session.renderer is not None:
-            session.renderer.clear()
-        gui = session.gui or {}
-        session.renderer = MotionRenderer(
-            session.client,
-            motion,
-            bool(gui.get("mesh").value) if "mesh" in gui else self.default_mesh,
-            bool(gui.get("skeleton").value) if "skeleton" in gui else not self.default_mesh,
-        )
-        session.entry_index = index
-        session.fps = fps
-        session.playing = False
-        session.next_frame_time = time.monotonic()
-        if gui:
-            gui["frame"].max = max(0, session.renderer.length - 1)
-            gui["frame"].value = 0
-            gui["fps"].value = fps
-            gui["info"].content = f"### {entry.id}\n`{entry.label}`\n\n{entry.caption}"
+        with self.lock:
+            session.playing = False
+            previous_renderer = session.renderer
+            session.renderer = None
+            if previous_renderer is not None:
+                previous_renderer.clear()
+            gui = session.gui or {}
+            session.renderer = MotionRenderer(
+                session.client,
+                motion,
+                bool(gui.get("mesh").value) if "mesh" in gui else self.default_mesh,
+                bool(gui.get("skeleton").value) if "skeleton" in gui else not self.default_mesh,
+            )
+            session.entry_index = index
+            session.fps = fps
+            session.next_frame_time = time.monotonic()
+            if gui:
+                gui["frame"].max = max(0, session.renderer.length - 1)
+                gui["frame"].value = 0
+                gui["fps"].value = fps
+                gui["info"].content = f"### {entry.id}\n`{entry.label}`\n\n{entry.caption}"
 
     def _on_connect(self, client) -> None:
         client.camera.position = np.array([2.7, 1.9, 7.7])
@@ -359,7 +364,8 @@ class MotionJEPADatasetViewer:
             infinite_grid=True,
         )
         session = ViewerSession(client=client, entry_index=self.initial_index)
-        self.sessions[client.client_id] = session
+        with self.lock:
+            self.sessions[client.client_id] = session
         labels = [entry.label for entry in self.entries]
         with client.gui.add_folder("Dataset", expand_by_default=True):
             dropdown = client.gui.add_dropdown("Motion", labels, initial_value=labels[self.initial_index])
@@ -389,11 +395,12 @@ class MotionJEPADatasetViewer:
         self._load_entry(session, self.initial_index)
 
         def set_frame(value: int) -> None:
-            if session.renderer is None:
-                return
-            session.renderer.set_frame(value, bool(contacts.value))
-            if frame.value != session.renderer.frame:
-                frame.value = session.renderer.frame
+            with self.lock:
+                if session.renderer is None:
+                    return
+                session.renderer.set_frame(value, bool(contacts.value))
+                if frame.value != session.renderer.frame:
+                    frame.value = session.renderer.frame
 
         @dropdown.on_update
         def _(_event):
@@ -405,55 +412,76 @@ class MotionJEPADatasetViewer:
 
         @play.on_click
         def _(_event):
-            session.playing = not session.playing
+            with self.lock:
+                session.playing = not session.playing
+                session.next_frame_time = time.monotonic()
 
         @previous.on_click
         def _(_event):
-            set_frame(int(frame.value) - 1)
+            with self.lock:
+                set_frame(int(frame.value) - 1)
 
         @next_.on_click
         def _(_event):
-            set_frame(int(frame.value) + 1)
+            with self.lock:
+                set_frame(int(frame.value) + 1)
 
         @speed.on_click
         def _(_event):
-            session.speed = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}[speed.value]
+            with self.lock:
+                session.speed = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}[speed.value]
 
         @mesh.on_update
         def _(_event):
-            if session.renderer:
-                session.renderer.set_mesh_visible(bool(mesh.value))
+            with self.lock:
+                if session.renderer:
+                    session.renderer.set_mesh_visible(bool(mesh.value))
 
         @opacity.on_update
         def _(_event):
-            if session.renderer:
-                session.renderer.set_mesh_opacity(float(opacity.value))
+            with self.lock:
+                if session.renderer:
+                    session.renderer.set_mesh_opacity(float(opacity.value))
 
         @skeleton.on_update
         def _(_event):
-            if session.renderer:
-                session.renderer.joints.visible = bool(skeleton.value)
-                session.renderer.bones.visible = bool(skeleton.value)
+            with self.lock:
+                if session.renderer:
+                    session.renderer.joints.visible = bool(skeleton.value)
+                    session.renderer.bones.visible = bool(skeleton.value)
 
         @contacts.on_update
         def _(_event):
             set_frame(int(frame.value))
 
     def _on_disconnect(self, client) -> None:
-        self.sessions.pop(client.client_id, None)
+        with self.lock:
+            session = self.sessions.pop(client.client_id, None)
+            if session is not None:
+                session.playing = False
+                session.renderer = None
 
     def close(self) -> None:
-        self.closed = True
+        with self.lock:
+            self.closed = True
+        if threading.current_thread() is not self._playback_thread:
+            self._playback_thread.join(timeout=1.0)
 
     def _playback_loop(self) -> None:
         while not self.closed:
             now = time.monotonic()
-            for session in list(self.sessions.values()):
-                renderer = session.renderer
-                if renderer is None or not session.playing or session.gui is None:
-                    continue
-                period = 1.0 / max(float(session.fps) * session.speed, 1.0)
-                if now >= session.next_frame_time:
+            with self.lock:
+                sessions = list(self.sessions.values())
+            for session in sessions:
+                with self.lock:
+                    renderer = session.renderer
+                    if self.closed:
+                        return
+                    if renderer is None or not session.playing or session.gui is None:
+                        continue
+                    period = 1.0 / max(float(session.fps) * session.speed, 1.0)
+                    if now < session.next_frame_time:
+                        continue
                     next_frame = 0 if renderer.frame >= renderer.length - 1 else renderer.frame + 1
                     renderer.set_frame(next_frame, bool(session.gui["contacts"].value))
                     session.gui["frame"].value = next_frame

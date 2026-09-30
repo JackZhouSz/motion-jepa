@@ -181,8 +181,9 @@ class TMRDatasetViewer(MotionJEPADatasetViewer):
             )
 
     def _load_entry(self, session: ViewerSession, index: int) -> None:
-        super()._load_entry(session, index)
-        self._update_pair_info(session)
+        with self.lock:
+            super()._load_entry(session, index)
+            self._update_pair_info(session)
 
     def _on_connect(self, client) -> None:
         super()._on_connect(client)
