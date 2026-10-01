@@ -21,12 +21,21 @@ class AlignmentConfig:
     num_heads: int = 4
     ff_dim: int = 1024
     dropout: float = 0.1
+    text_depth: int | None = None
+    motion_depth: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("text_dim", "motion_dim", "embed_dim", "depth", "num_heads", "ff_dim"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        for name in ("text_depth", "motion_depth"):
+            value = getattr(self, name)
+            if value is None:
+                value = self.depth
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            object.__setattr__(self, name, value)
         if self.embed_dim % 2:
             raise ValueError("embed_dim must be even for sinusoidal positions")
         if self.embed_dim % self.num_heads:
@@ -38,7 +47,7 @@ class AlignmentConfig:
 class _SequenceReadout(nn.Module):
     """Project token sequences and pool them with a learnable CLS token."""
 
-    def __init__(self, input_dim: int, config: AlignmentConfig) -> None:
+    def __init__(self, input_dim: int, config: AlignmentConfig, *, depth: int) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.input_projection = nn.Linear(input_dim, config.embed_dim)
@@ -52,7 +61,7 @@ class _SequenceReadout(nn.Module):
                 drop=config.dropout,
                 attn_drop=config.dropout,
             )
-            for _ in range(config.depth)
+            for _ in range(depth)
         )
         self.norm = nn.LayerNorm(config.embed_dim)
         self.apply(initialize_transformer)
@@ -97,8 +106,8 @@ class TextMotionAlignment(nn.Module):
     def __init__(self, config: AlignmentConfig) -> None:
         super().__init__()
         self.config = config
-        self.text_encoder = _SequenceReadout(config.text_dim, config)
-        self.motion_encoder = _SequenceReadout(config.motion_dim, config)
+        self.text_encoder = _SequenceReadout(config.text_dim, config, depth=config.text_depth)
+        self.motion_encoder = _SequenceReadout(config.motion_dim, config, depth=config.motion_depth)
 
     def encode_text(self, tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         return self.text_encoder(tokens, valid_mask)

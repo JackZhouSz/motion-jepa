@@ -47,7 +47,7 @@ class AlignmentModelTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(bf16_output).all())
 
     def test_cls_and_independent_heads_train_with_frozen_external_backbones(self):
-        model = TextMotionAlignment(self.config)
+        model = TextMotionAlignment(AlignmentConfig(**(vars(self.config) | {"motion_depth": 1})))
         text_backbone = nn.Linear(5, 12).eval().requires_grad_(False)
         motion_backbone = nn.Linear(3, 7).eval().requires_grad_(False)
         frozen_text = copy.deepcopy(text_backbone.state_dict())
@@ -97,6 +97,8 @@ class AlignmentModelTest(unittest.TestCase):
         for changes in (
             {"depth": 0}, {"embed_dim": 15}, {"num_heads": 3},
             {"text_dim": -1}, {"dropout": 1.0}, {"dropout": float("nan")},
+            {"text_depth": 0}, {"motion_depth": -1}, {"motion_depth": True},
+            {"text_depth": 1.5},
         ):
             values = vars(self.config) | changes
             with self.assertRaises(ValueError):
@@ -106,6 +108,31 @@ class AlignmentModelTest(unittest.TestCase):
         restored.load_state_dict(model.state_dict(), strict=True)
         tokens, active = torch.randn(2, 4, 7), torch.ones(2, 4, dtype=torch.bool)
         torch.testing.assert_close(model.encode_motion(tokens, active), restored.encode_motion(tokens, active))
+
+    def test_depth_overrides_and_legacy_model_state_compatibility(self):
+        legacy_config = {key: value for key, value in vars(self.config).items()
+                         if key not in ("text_depth", "motion_depth")}
+        for overrides, expected_depths in (
+            ({}, (2, 2)),
+            ({"motion_depth": 1}, (2, 1)),
+            ({"text_depth": 3}, (3, 2)),
+            ({"text_depth": 3, "motion_depth": 1}, (3, 1)),
+        ):
+            with self.subTest(overrides=overrides):
+                model = TextMotionAlignment(AlignmentConfig(**legacy_config, **overrides))
+                self.assertEqual((len(model.text_encoder.blocks), len(model.motion_encoder.blocks)), expected_depths)
+
+        torch.manual_seed(22)
+        legacy = TextMotionAlignment(AlignmentConfig(**legacy_config)).eval()
+        torch.manual_seed(22)
+        shallow = TextMotionAlignment(AlignmentConfig(**legacy_config, motion_depth=1)).eval()
+        # Changing only motion capacity preserves the complete text-head initialization.
+        for name, value in legacy.text_encoder.state_dict().items():
+            torch.testing.assert_close(value, shallow.text_encoder.state_dict()[name], rtol=0, atol=0)
+        explicit = TextMotionAlignment(AlignmentConfig(**legacy_config, text_depth=2, motion_depth=2)).eval()
+        explicit.load_state_dict(legacy.state_dict(), strict=True)
+        tokens, mask = torch.randn(2, 4, 7), torch.ones(2, 4, dtype=torch.bool)
+        torch.testing.assert_close(legacy.encode_motion(tokens, mask), explicit.encode_motion(tokens, mask))
 
 
 class ContrastiveLossTest(unittest.TestCase):

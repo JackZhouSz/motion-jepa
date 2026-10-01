@@ -143,6 +143,9 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
         input_source: str = "raw",
         resume: bool = False,
         num_workers: int = 0,
+        train_fraction: float = 1.0,
+        text_depth: int | None = None,
+        motion_depth: int | None = None,
     ):
         from experiment.tmr import train
 
@@ -157,6 +160,7 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
             "--output-root", str(output),
             "--device", "cpu",
             "--seed", "42",
+            "--train-fraction", str(train_fraction),
             "--epochs", "2",
             "--warmup-epochs", "0",
             "--batch-size", "2",
@@ -175,6 +179,10 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
         ]
         if input_source == "jepa":
             command += ["--jepa-checkpoint", str(root / "jepa.pth.tar")]
+        if text_depth is not None:
+            command += ["--text-depth", str(text_depth)]
+        if motion_depth is not None:
+            command += ["--motion-depth", str(motion_depth)]
         if resume:
             command.append("--resume")
         return train.build_parser().parse_args(command)
@@ -221,20 +229,26 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
         return latest
 
     def _assert_deterministic_resume(
-        self, root: Path, annotations: Path, num_workers: int
+        self, root: Path, annotations: Path, num_workers: int, train_fraction: float = 1.0,
+        *, text_depth: int | None = None, motion_depth: int | None = None,
+        legacy_checkpoint: bool = False,
     ) -> tuple[Path, dict]:
         from experiment.tmr import train
 
         raw_output = root / f"raw-workers-{num_workers}"
         raw_summary = train.run(self._training_args(
-            root, annotations, raw_output, num_workers=num_workers
+            root, annotations, raw_output, num_workers=num_workers, train_fraction=train_fraction,
+            text_depth=text_depth, motion_depth=motion_depth,
         ))
         self.assertEqual(raw_summary["input_source"], "raw")
         uninterrupted = self._assert_completed_run(raw_output, raw_summary)
+        self.assertEqual(uninterrupted["config"]["model"]["text_depth"], text_depth or 1)
+        self.assertEqual(uninterrupted["config"]["model"]["motion_depth"], motion_depth or 1)
 
         resumed_output = root / f"resumed-workers-{num_workers}"
         interrupted_args = self._training_args(
-            root, annotations, resumed_output, num_workers=num_workers
+            root, annotations, resumed_output, num_workers=num_workers, train_fraction=train_fraction,
+            text_depth=text_depth, motion_depth=motion_depth,
         )
         original_save = train._atomic_torch_save
 
@@ -250,6 +264,20 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
             resumed_output / "latest.pth.tar", map_location="cpu", weights_only=False
         )
         self.assertEqual(interrupted["next_epoch"], 1)
+        if legacy_checkpoint:
+            # Historical checkpoints contain only the shared depth. Preserve all
+            # states while exercising their resume and standalone-evaluation paths.
+            for path in (resumed_output / "latest.pth.tar", resumed_output / "best.pth.tar"):
+                saved = torch.load(path, map_location="cpu", weights_only=False)
+                saved["config"]["model"].pop("text_depth")
+                saved["config"]["model"].pop("motion_depth")
+                original_save(saved, path)
+            from experiment.tmr import evaluate
+
+            evaluate.run(evaluate.build_parser().parse_args([
+                "--checkpoint", str(resumed_output / "best.pth.tar"), "--split", "val",
+                "--device", "cpu", "--batch-size", "2", "--num-workers", "0",
+            ]))
         # Emulate logs written after the last committed checkpoint. Resume must
         # purge these orphan events while keeping that checkpoint's evaluation.
         from torch.utils.tensorboard import SummaryWriter
@@ -257,9 +285,13 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
         with SummaryWriter(log_dir=str(resumed_output / "tensorboard")) as writer:
             writer.add_scalar("train/loss", -999, interrupted["global_step"] + 1)
             writer.add_scalar("val/mean_r1", -999, interrupted["global_step"] + 1)
-        resumed_summary = train.run(self._training_args(
-            root, annotations, resumed_output, resume=True, num_workers=num_workers
-        ))
+        resumed_args = self._training_args(
+            root, annotations, resumed_output, resume=True, num_workers=num_workers, train_fraction=train_fraction,
+            text_depth=text_depth or 1, motion_depth=motion_depth or 1,
+        )
+        # Explicit head depths describe the same architecture despite a different fallback.
+        resumed_args.depth = 6
+        resumed_summary = train.run(resumed_args)
         resumed = self._assert_completed_run(resumed_output, resumed_summary)
         self.assertEqual(resumed_summary["test"], raw_summary["test"])
         self.assertEqual(resumed_summary["best_epoch"], raw_summary["best_epoch"])
@@ -269,12 +301,99 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
             )
 
         changed_args = self._training_args(
-            root, annotations, resumed_output, resume=True, num_workers=num_workers
+            root, annotations, resumed_output, resume=True, num_workers=num_workers, train_fraction=train_fraction,
+            text_depth=text_depth, motion_depth=motion_depth,
         )
         changed_args.lr *= 2
         with self.assertRaisesRegex(ValueError, "(?i)resume|config|signature|differ"):
             train.run(changed_args)
+        changed_args.lr /= 2
+        changed_args.text_depth = text_depth or 1
+        changed_args.motion_depth = (motion_depth or 1) + 1
+        with self.assertRaisesRegex(ValueError, "Resume config"):
+            train.run(changed_args)
+        if train_fraction != 1:
+            changed_args.motion_depth = motion_depth or 1
+            changed_args.train_fraction = .5
+            with self.assertRaisesRegex(ValueError, "Resume config"):
+                train.run(changed_args)
         return raw_output, raw_summary
+
+    def test_invalid_head_depths_fail_before_loading_features(self):
+        from experiment.tmr import train
+
+        for flag in ("--depth", "--text-depth", "--motion-depth"):
+            for value in ("0", "-1"):
+                with self.subTest(flag=flag, value=value):
+                    args = train.build_parser().parse_args([flag, value])
+                    with mock.patch.object(train, "load_prepared_datasets") as load_features:
+                        with self.assertRaisesRegex(ValueError, flag):
+                            train.run(args)
+                        load_features.assert_not_called()
+
+    def test_fraction_reuses_full_cache_for_both_inputs_resume_and_evaluation(self):
+        from experiment.tmr import evaluate, features, train
+        from experiment.tmr.dataset import json_digest
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            annotations = _write_paired_fixture(root / "dataset")
+            _write_text_backbone(root / "tiny-text")
+            _write_checkpoint(root / "jepa.pth.tar", root / "dataset/stats")
+            for source in ("raw", "jepa"):
+                features.prepare_caches(
+                    dataset_root=root / "dataset", annotations_path=annotations,
+                    cache_root=root / "cache", input_source=source,
+                    jepa_checkpoint=root / "jepa.pth.tar" if source == "jepa" else None,
+                    stats_path=root / "dataset/stats", text_model=str(root / "tiny-text"),
+                    max_text_length=32, device="cpu", feature_batch_size=2, text_batch_size=2,
+                )
+            cached_files = {path: _file_hash(path) for path in (root / "cache").rglob("*") if path.is_file()}
+            paired = {}
+            with (
+                mock.patch.object(features, "load_text_backbone", side_effect=AssertionError("text backbone loaded")),
+                mock.patch.object(features, "load_frozen_encoder", side_effect=AssertionError("JEPA backbone loaded")),
+            ):
+                for source in ("raw", "jepa"):
+                    args = self._training_args(root, annotations, root / f"{source}-subset", input_source=source, train_fraction=.75)
+                    datasets, provenance = features.load_prepared_datasets(**train.data_configuration(args))
+                    self.assertEqual({split: len(dataset) for split, dataset in datasets.items()}, {"train": 3, "val": 2, "test": 2})
+                    paired[source] = datasets["train"].sample_ids
+                    self.assertEqual(provenance["train_subset"]["sample_ids_sha256"], json_digest(paired[source]))
+                    if source == "jepa":
+                        selected = torch.cat([datasets["train"].motion_bank[key] for key in paired[source]]).double()
+                        torch.testing.assert_close(datasets["train"].motion_mean, selected.mean(0).float())
+                        torch.testing.assert_close(datasets["train"].motion_std, selected.std(0, correction=0).float().clamp_min(1e-6))
+                        self.assertEqual(provenance["jepa_feature_stats"]["num_tokens"], len(selected))
+                        for split in ("val", "test"):
+                            dataset = datasets[split]
+                            original = dataset.motion_bank[dataset.sample_ids[0]]
+                            torch.testing.assert_close(dataset[0]["motion_tokens"], (original - datasets["train"].motion_mean) / datasets["train"].motion_std)
+                    else:
+                        self.assertIsNone(datasets["train"].motion_mean)
+                self.assertEqual(paired["raw"], paired["jepa"])
+                self.assertEqual(
+                    features.prepare_jepa_statistics(root / "cache", train_fraction=.75, train_subset_seed=42),
+                    provenance["jepa_feature_stats"],
+                )
+                runs = []
+                for workers in (0, 2):
+                    runs.append(self._assert_deterministic_resume(root, annotations, workers, train_fraction=.75))
+                jepa_output = root / "jepa-subset"
+                jepa_summary = train.run(self._training_args(root, annotations, jepa_output, input_source="jepa", train_fraction=.75))
+                saved = self._assert_completed_run(jepa_output, jepa_summary)
+                self.assertEqual(saved["config"]["data"]["train_fraction"], .75)
+                runs.append((jepa_output, jepa_summary))
+                for output, summary in runs:
+                    self.assertEqual(summary["split_counts"], {"train": 3, "val": 2, "test": 2})
+                    manifest = json.loads((output / "train-subset.json").read_text())
+                    self.assertEqual(manifest["sample_ids"], paired["raw"])
+                    evaluation_args = evaluate.build_parser().parse_args([
+                        "--checkpoint", str(output / "best.pth.tar"), "--split", "test",
+                        "--device", "cpu", "--batch-size", "2", "--num-workers", "0",
+                    ])
+                    self.assertEqual(evaluate.run(evaluation_args), summary["test"])
+            self.assertEqual(cached_files, {path: _file_hash(path) for path in cached_files})
 
     def test_cache_train_resume_and_standalone_evaluation_for_both_inputs(self):
         from experiment.tmr import evaluate, features, train
@@ -333,16 +452,22 @@ class TMRTrainingIntegrationTest(unittest.TestCase):
                 for num_workers in (0, 2):
                     with self.subTest(num_workers=num_workers):
                         raw_runs.append(self._assert_deterministic_resume(
-                            root, annotations, num_workers
+                            root, annotations, num_workers,
+                            text_depth=2 if num_workers == 2 else None,
+                            motion_depth=1 if num_workers == 2 else None,
+                            legacy_checkpoint=num_workers == 0,
                         ))
 
                 jepa_output = root / "jepa-output"
                 jepa_summary = train.run(self._training_args(
-                    root, annotations, jepa_output, input_source="jepa"
+                    root, annotations, jepa_output, input_source="jepa",
+                    text_depth=2, motion_depth=1,
                 ))
                 self.assertEqual(jepa_summary["input_source"], "jepa")
                 saved_jepa = self._assert_completed_run(jepa_output, jepa_summary)
                 self.assertIn("jepa_feature_stats", saved_jepa["provenance"])
+                self.assertEqual(saved_jepa["config"]["model"]["text_depth"], 2)
+                self.assertEqual(saved_jepa["config"]["model"]["motion_depth"], 1)
 
                 quiet_output = root / "no-tensorboard"
                 quiet_args = self._training_args(root, annotations, quiet_output)

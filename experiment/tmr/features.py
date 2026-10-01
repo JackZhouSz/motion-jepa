@@ -24,7 +24,7 @@ from .utils import resolve_device
 from .dataset import (
     DEFAULT_ANNOTATIONS_PATH, DEFAULT_CACHE_ROOT, DEFAULT_DATASET_ROOT,
     DEFAULT_TEXT_MODEL, SPLITS, PreparedPairDataset, RaggedTokenBank,
-    build_paired_index, json_digest,
+    build_paired_index, json_digest, select_training_subset,
 )
 from .normalization import ensure_feature_statistics
 
@@ -353,16 +353,18 @@ def prepare_caches(
     return metadata
 
 
-def _jepa_statistics(cache, paired, metadata, *, recompute=False):
+def _jepa_statistics(cache, paired, metadata, *, recompute=False, sample_ids=None):
     stats = {key: metadata[key] for key in ("stats_root", "stats_mean_sha256", "stats_std_sha256")}
     bank = RaggedTokenBank(cache / "jepa/train", _motion_signature(paired, stats, metadata["jepa_source"]))
     keys = [record["sample_id"] for record in paired["records"] if record["split"] == "train"]
     if bank.keys != keys:
         raise ValueError("JEPA statistics must use exactly the captioned training samples")
-    return ensure_feature_statistics(bank, recompute=recompute)
+    return ensure_feature_statistics(bank, recompute=recompute, sample_ids=sample_ids)
 
 
-def prepare_jepa_statistics(cache_root=DEFAULT_CACHE_ROOT, *, recompute=False):
+def prepare_jepa_statistics(
+    cache_root=DEFAULT_CACHE_ROOT, *, recompute=False, train_fraction=1.0, train_subset_seed=42,
+):
     """Upgrade a completed JEPA cache without loading either frozen backbone."""
     cache = Path(cache_root).expanduser().resolve()
     marker = cache / "jepa/prepared.json"
@@ -373,9 +375,15 @@ def prepare_jepa_statistics(cache_root=DEFAULT_CACHE_ROOT, *, recompute=False):
     for key in ("paired_index_sha256", "catalog_sha256", "provenance", "split_counts", "filtered_counts"):
         if paired[key] != metadata[key]:
             raise ValueError("Prepared JEPA paired index is stale; run prepare_cache")
-    _, _, stats = _jepa_statistics(cache, paired, metadata, recompute=recompute)
-    metadata["jepa_feature_stats"] = stats
-    _atomic_json_save(metadata, marker)
+    records, subset = select_training_subset(
+        [record for record in paired["records"] if record["split"] == "train"],
+        train_fraction, train_subset_seed,
+    )
+    sample_ids = [record["sample_id"] for record in records] if subset is not None else None
+    _, _, stats = _jepa_statistics(cache, paired, metadata, recompute=recompute, sample_ids=sample_ids)
+    if subset is None:
+        metadata["jepa_feature_stats"] = stats
+        _atomic_json_save(metadata, marker)
     return stats
 
 
@@ -383,6 +391,7 @@ def load_prepared_datasets(
     dataset_root, annotations_path, cache_root, input_source,
     jepa_checkpoint=None, checkpoint_key="target_encoder", stats_path=None,
     text_model=DEFAULT_TEXT_MODEL, text_revision=None, max_text_length=256,
+    train_fraction=1.0, train_subset_seed=42,
 ):
     """Validate provenance without instantiating or deserializing either backbone."""
     root, cache = Path(dataset_root).expanduser().resolve(), Path(cache_root).expanduser().resolve()
@@ -401,6 +410,10 @@ def load_prepared_datasets(
     for key in ("paired_index_sha256", "catalog_sha256", "provenance", "split_counts", "filtered_counts"):
         if metadata[key] != paired[key]:
             raise ValueError("Prepared TMR cache metadata is stale; use --recompute-features")
+    train_records, subset = select_training_subset(
+        [record for record in paired["records"] if record["split"] == "train"],
+        train_fraction, train_subset_seed,
+    )
     signature = _text_signature(paired, text_model, text_revision, max_text_length)
     text_bank = RaggedTokenBank(cache / "text", signature)
     if metadata["text_signature"] != signature or metadata["text_source"] != text_bank.metadata["model_info"]:
@@ -422,16 +435,21 @@ def load_prepared_datasets(
     if input_source == "jepa":
         for split in SPLITS:
             motion_banks[split] = RaggedTokenBank(cache / "jepa" / split, _motion_signature(paired, stats, source))
-        mean, std, feature_stats = _jepa_statistics(cache, paired, metadata)
-        if "jepa_feature_stats" in metadata and metadata["jepa_feature_stats"] != feature_stats:
+        sample_ids = [record["sample_id"] for record in train_records] if subset is not None else None
+        mean, std, feature_stats = _jepa_statistics(cache, paired, metadata, sample_ids=sample_ids)
+        if subset is None and "jepa_feature_stats" in metadata and metadata["jepa_feature_stats"] != feature_stats:
             raise ValueError("Prepared JEPA feature statistics are stale; run prepare_stats --recompute")
-        if "jepa_feature_stats" not in metadata:
+        if subset is None and "jepa_feature_stats" not in metadata:
             # Existing format-2 features can gain train-only statistics without re-extraction.
             metadata["jepa_feature_stats"] = feature_stats
             _atomic_json_save(metadata, marker)
+        if subset is not None:
+            metadata["jepa_feature_stats"] = feature_stats
+    if subset is not None:
+        metadata["train_subset"] = subset
     datasets = {}
     for split in SPLITS:
-        records = [record for record in paired["records"] if record["split"] == split]
+        records = train_records if split == "train" else [record for record in paired["records"] if record["split"] == split]
         if input_source == "raw":
             datasets[split] = PreparedPairDataset(
                 records, text_bank, raw_dataset=_raw_dataset(root, split, paired, stats_root),

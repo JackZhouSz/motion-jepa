@@ -33,6 +33,32 @@ def json_digest(value: Any) -> str:
     ).hexdigest()
 
 
+def select_training_subset(records, fraction=1.0, seed=42):
+    """Keep a fixed, nested random subset of captioned train motion clips."""
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError("train_fraction must be finite and in (0, 1]")
+    if fraction == 1:
+        return records, None
+    count = math.floor(len(records) * fraction)
+    if count < 2:
+        raise ValueError(
+            f"train_fraction={fraction} selects {count} of {len(records)} training clips; "
+            "at least two are required for contrastive training"
+        )
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    order = torch.randperm(len(records), generator=generator, device="cpu")
+    # Sampling uses a permutation prefix; sorting selected rows improves cache
+    # locality and preserves original dataset order without changing membership.
+    indices = order[:count].sort().values.tolist()
+    selected = [records[index] for index in indices]
+    return selected, {
+        "fraction": float(fraction), "seed": int(seed), "available_samples": len(records),
+        "selected_samples": count,
+        "sample_ids_sha256": json_digest([record["sample_id"] for record in selected]),
+        "policy": "seeded_permutation_prefix_floor_v1",
+    }
+
+
 def collect_caption_candidates(
     events: Sequence[dict[str, Any]], start_frame: int, end_frame: int, fps: int
 ) -> tuple[list[str], list[int]]:

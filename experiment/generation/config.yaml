@@ -1,0 +1,36 @@
+jepa_checkpoint: output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150/motion-jepa-patch-1d-p3-ep300.pth.tar
+dataset_root: dataset/bones-seed-processed-nframes150
+stats_path: null
+cache_root: output/prediction/cache/baseline-ep300
+output: output/generation/baseline-ep300/seed-42
+device: auto
+seed: 42
+epochs: 100
+batch_size: 256
+cache_batch_size: 256
+num_workers: 8
+lr: 0.0003
+final_lr: 0.000001
+weight_decay: 0.01
+warmup_epochs: 5
+gradient_clip: 1.0
+use_bfloat16: true
+tensorboard: true
+limit_train: 0
+limit_val: 0
+limit_test: 0
+condition_dropout: 0.1
+ema_decay: 0.999
+evaluation_seed: 42
+steps: 32
+guidance_scale: 1.0
+num_samples: 4
+diagnostic_count: 512
+export_count: 16
+deterministic_checkpoint: null
+flow:
+  hidden_dim: 384
+  depth: 4
+  num_heads: 6
+  ffn_dim: 1536
+  dropout: 0.0

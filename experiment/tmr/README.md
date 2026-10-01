@@ -33,9 +33,13 @@ authenticated cache is `/data/seokhyeon/hf-cache`, so set
 
 The complete valid encoder token sequence is retained. Each trainable readout
 projects its input to 256 dimensions, prepends its own learnable CLS token, adds
-sinusoidal positions, and applies six pre-norm Transformer blocks (four heads,
-1024-wide FFN, dropout 0.1). The final LayerNorm CLS output is L2-normalized. CLS is
-added after the frozen text encoder, not to its tokenizer input.
+sinusoidal positions, and applies six pre-norm Transformer blocks by default (four
+heads, 1024-wide FFN, dropout 0.1). `--text-depth` and `--motion-depth` independently
+set the number of blocks in the trainable alignment heads. Each defaults to
+`--depth` (6); an individual option overrides the shared value for that head only.
+These options do not change the frozen T5Gemma or JEPA backbones. The final
+LayerNorm CLS output is L2-normalized. CLS is added after the frozen text encoder,
+not to its tokenizer input.
 
 Raw motion uses `[150,366]` frame features. JEPA uses the checkpoint's temporal
 tokens, e.g. `[50,384]` for the current 3-frame patch encoder. For 2D checkpoints,
@@ -94,9 +98,9 @@ Run from the repository root with `motion-jepa` activated. Use the same paired
 cache, normalization statistics, seed, and head/training settings for both branches:
 
 ```bash
-TMR_JEPA_CHECKPOINT=output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150-segmentation-20260930/motion-jepa-patch-1d-p3-ep300.pth.tar
+TMR_JEPA_CHECKPOINT=output/mot_patch_base_1d-p3-bs.512-ep.300-nframes150/motion-jepa-patch-1d-p3-latest.pth.tar
 TMR_STATS=dataset/bones-seed-processed-nframes150/stats
-TMR_CACHE=output/tmr/cache
+TMR_CACHE=dataset/tmr-cache
 
 python -m experiment.tmr.prepare_cache \
   --input-source raw --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE"
@@ -162,6 +166,73 @@ clips from the same source with overlapping time intervals are excluded from
 negatives. Semantically similar but
 different captions remain negatives; no unvalidated text-similarity threshold is
 used. A final singleton training batch is skipped because it has no negatives.
+
+To compare motion-head capacity, keep the text head at six blocks and use a
+one-block motion head for both inputs. Reuse the existing prepared cache and
+compare these new runs with the default six-block runs:
+
+```bash
+python -m experiment.tmr \
+  --input-source raw --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE" \
+  --text-depth 6 --motion-depth 1 --seed 42 \
+  --output-root output/tmr/raw-motion-depth1/seed-42
+
+python -m experiment.tmr \
+  --input-source jepa --jepa-checkpoint "$TMR_JEPA_CHECKPOINT" \
+  --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE" \
+  --text-depth 6 --motion-depth 1 --seed 42 \
+  --output-root output/tmr/jepa-motion-depth1/seed-42
+```
+
+Use `--motion-depth 2` and new output directories for the two-block comparison.
+Both commands retain the existing defaults of 100 epochs, batch 256, LR `1e-4`,
+and full training data. Add `--train-fraction 0.1` to both for the 10% comparison,
+using separate output directories for that fraction. No backbone feature
+extraction is needed when changing head depth.
+
+`config.json` and checkpoints record both resolved head depths. Standalone
+evaluation restores these automatically. Historical checkpoints with only
+`depth` still load and resume with that depth for both heads. Resume checks the
+effective head depths; changing the shared fallback while explicitly retaining
+both original head depths is allowed. Changing either head's depth requires a
+new training run and output directory.
+
+Use `--train-fraction` to compare training sizes while reusing the prepared cache:
+
+```bash
+python -m experiment.tmr \
+  --input-source raw --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE" \
+  --train-fraction 0.1 --seed 42 --output-root output/tmr/raw/fraction-0.1/seed-42
+
+python -m experiment.tmr \
+  --input-source jepa --jepa-checkpoint "$TMR_JEPA_CHECKPOINT" \
+  --stats-path "$TMR_STATS" --cache-root "$TMR_CACHE" \
+  --train-fraction 0.1 --seed 42 --output-root output/tmr/jepa/fraction-0.1/seed-42
+```
+
+The default fraction is `1.0`; accepted values are `0 < fraction <= 1`.
+The selected count is `floor(fraction * N)`, where N is the number of captioned
+train clips in the prepared cache. Selecting fewer than two clips raises an error.
+Only training is reduced: validation/test motions and caption galleries remain
+complete for that cache. Selection samples motion clips, not source sequences or
+individual caption candidates. An already limited smoke cache uses its own train
+count as N and retains its existing validation/test limits.
+
+`--seed` determines a fixed random permutation. Fractions take prefixes of that
+same permutation, so smaller subsets are contained in larger ones. Raw and JEPA
+use the same clip IDs when the paired cache, fraction, and seed match. Caption
+sampling continues independently on each training access. The chosen IDs are
+saved in `<output-root>/train-subset.json`; checkpoints fingerprint the selection,
+and resume requires the same fraction and seed. Standalone evaluation restores
+the selection from the checkpoint without extra arguments.
+
+For JEPA, mean/std use only the selected training clips' valid tokens and are
+applied to train, validation, and test. Subset statistics are cached separately
+under `<cache-root>/jepa/stats-subsets/<signature>/`; full-cache statistics and
+backbone features remain available for other training sizes. For a subset, run
+`prepare_stats --train-fraction 0.1 --seed 42` to compute statistics separately,
+adding `--recompute` to repair them. Use a different output directory for each
+fraction/seed experiment. Raw input normalization continues to use `--stats-path`.
 
 Validation and test use complete galleries, never minibatch retrieval. Text queries
 and candidates are all unique candidate captions; motion queries and candidates

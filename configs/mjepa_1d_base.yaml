@@ -1,6 +1,6 @@
 data:
   batch_size: 512  # Per rank; global batch is batch_size * world_size.
-  root_path: ./dataset/bones-seed-processed
+  root_path: ./dataset/bones-seed-processed-nframes150
   meta_files:
     - train.txt
   num_workers: 8
@@ -21,6 +21,26 @@ logging:
   tensorboard: true
   tensorboard_folder: tensorboard
   checkpoint_freq: 100
+
+linear_probe:
+  enabled: false
+
+segmentation_probe:
+  enabled: true
+  frequency: 30
+  dataset_root: ./dataset/babel-segmentation-120-processed-nframes30-150
+  epochs: 50
+  feature_batch_size: 256
+  batch_size: 256
+  num_workers: 8
+  lr: 0.3
+  momentum: 0.9
+  weight_decay: 0.0
+  seed: 42
+  standardize: true
+
+attentive_probe:
+  enabled: false
 
 mask:
   allow_overlap: false

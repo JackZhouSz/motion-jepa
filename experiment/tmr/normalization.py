@@ -6,13 +6,14 @@ import hashlib
 import json
 import os
 import shutil
+from typing import Sequence
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from experiment.linear_probe.features import _atomic_json_save
-from .dataset import RaggedTokenBank
+from .dataset import RaggedTokenBank, json_digest
 
 
 FEATURE_STD_EPSILON = 1e-6
@@ -30,6 +31,7 @@ def _file_digest(path):
 
 def ensure_feature_statistics(
     train_bank: RaggedTokenBank, *, recompute: bool = False, chunk_size: int = 8192,
+    sample_ids: Sequence[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     """Compute population moments from cached valid tokens, never padded frames.
 
@@ -38,7 +40,21 @@ def ensure_feature_statistics(
     """
     if chunk_size < 1:
         raise ValueError("Statistics chunk size must be positive")
-    count, dim = int(train_bank.offsets[-1]), int(train_bank.metadata["feature_dim"])
+    dim = int(train_bank.metadata["feature_dim"])
+    if sample_ids is None:
+        ranges = [(0, int(train_bank.offsets[-1]))]
+    else:
+        if len(set(sample_ids)) != len(sample_ids) or any(key not in train_bank.key_to_row for key in sample_ids):
+            raise ValueError("Statistics sample IDs must be unique training cache keys")
+        ranges = []
+        for key in sample_ids:
+            row = train_bank.key_to_row[key]
+            first, last = int(train_bank.offsets[row]), int(train_bank.offsets[row + 1])
+            if ranges and ranges[-1][1] == first:
+                ranges[-1] = (ranges[-1][0], last)
+            else:
+                ranges.append((first, last))
+    count = sum(last - first for first, last in ranges)
     if count < 1:
         raise ValueError("JEPA feature statistics require nonempty training tokens")
     source = {
@@ -53,6 +69,13 @@ def ensure_feature_statistics(
         "epsilon": FEATURE_STD_EPSILON, **source,
     }
     root = train_bank.root.parent / "stats"
+    if sample_ids is not None:
+        signature.update({
+            "sample_ids_sha256": json_digest(list(sample_ids)), "num_samples": len(sample_ids),
+        })
+        # Separate subsets never overwrite each other's statistics or full-cache
+        # metadata. A rebuilt feature bank receives a different statistics path.
+        root = train_bank.root.parent / "stats-subsets" / json_digest(signature)
     if root.exists() and not recompute:
         marker = root / "complete.json"
         if not marker.is_file():
@@ -63,9 +86,14 @@ def ensure_feature_statistics(
     else:
         values = np.load(train_bank.root / "values.npy", mmap_mode="r", allow_pickle=False)
         mean, m2, seen = np.zeros(dim, dtype=np.float64), np.zeros(dim, dtype=np.float64), 0
-        for first in tqdm(range(0, count, chunk_size), desc="Train JEPA mean/std"):
+        chunks = (
+            (first, min(first + chunk_size, last))
+            for start, last in ranges for first in range(start, last, chunk_size)
+        )
+        num_chunks = sum((last - first + chunk_size - 1) // chunk_size for first, last in ranges)
+        for first, last in tqdm(chunks, total=num_chunks, desc="Train JEPA mean/std"):
             # BF16 bits occupy the high half of an IEEE float32; NumPy has no BF16 dtype.
-            chunk = (values[first:first + chunk_size].astype(np.uint32) << 16).view(np.float32)
+            chunk = (values[first:last].astype(np.uint32) << 16).view(np.float32)
             if not np.isfinite(chunk).all():
                 raise ValueError("Training JEPA cache contains non-finite tokens")
             chunk = chunk.astype(np.float64)

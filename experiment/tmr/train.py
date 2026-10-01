@@ -59,6 +59,9 @@ def data_configuration(args: argparse.Namespace) -> dict[str, Any]:
         if values[name] is not None:
             values[name] = str(Path(values[name]).expanduser().resolve())
     values["text_model"] = str(values["text_model"])
+    # Preserve the data configuration of existing full-data checkpoints.
+    if args.train_fraction != 1:
+        values.update(train_fraction=args.train_fraction, train_subset_seed=args.seed)
     return values
 
 
@@ -176,7 +179,17 @@ def load_alignment_checkpoint(path: Path) -> dict[str, Any]:
     return checkpoint
 
 
+def _canonical_configuration(config: dict[str, Any]) -> dict[str, Any]:
+    """Compare effective head depths, including legacy depth-only checkpoints."""
+    model = asdict(AlignmentConfig(**config["model"]))
+    # Once both head depths are resolved, the shared fallback is not architectural.
+    model.pop("depth")
+    return {**config, "model": model}
+
+
 def _validate_args(args: argparse.Namespace) -> None:
+    if not math.isfinite(args.train_fraction) or not 0 < args.train_fraction <= 1:
+        raise ValueError("--train-fraction must be finite and in (0, 1]")
     if args.epochs < 1 or not 0 <= args.warmup_epochs < args.epochs:
         raise ValueError("epochs must be positive and warmup_epochs in [0, epochs)")
     if args.batch_size < 2 or args.eval_batch_size < 1 or args.num_workers < 0 or args.chunk_size < 1:
@@ -191,6 +204,10 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be finite and nonnegative")
     if args.input_source == "jepa" and args.jepa_checkpoint is None:
         raise ValueError("--jepa-checkpoint is required for --input-source jepa")
+    for name in ("depth", "text_depth", "motion_depth"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be a positive integer")
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -213,6 +230,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         text_dim=provenance["text_dim"], motion_dim=provenance["motion_dim"],
         embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
         ff_dim=args.ff_dim, dropout=args.dropout,
+        text_depth=args.text_depth, motion_depth=args.motion_depth,
     )
     config = {
         "model": asdict(model_config), "data": data_config,
@@ -231,7 +249,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     history: list[dict[str, Any]] = []
     if args.resume:
         checkpoint = load_alignment_checkpoint(latest_path)
-        if checkpoint["config"] != config or checkpoint["provenance"] != provenance:
+        if (_canonical_configuration(checkpoint["config"]) != _canonical_configuration(config)
+                or checkpoint["provenance"] != provenance):
             raise ValueError("Resume config or feature provenance differs from the saved run")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -248,6 +267,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     _atomic_json_save(config, output / "config.json")
     _atomic_json_save(provenance, output / "provenance.json")
+    if "train_subset" in provenance:
+        _atomic_json_save({
+            **provenance["train_subset"], "sample_ids": datasets["train"].sample_ids,
+        }, output / "train-subset.json")
+    print(
+        f"TMR pairs: train={len(datasets['train'])} (fraction={args.train_fraction:g}), "
+        f"val={len(datasets['val'])}, test={len(datasets['test'])}", flush=True,
+    )
+    print(
+        f"TMR alignment heads: text_depth={model_config.text_depth}, "
+        f"motion_depth={model_config.motion_depth}", flush=True,
+    )
     _atomic_json_save({
         "python": sys.executable, "prefix": sys.prefix, "torch": str(torch.__version__),
         "device": str(device), "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
@@ -340,7 +371,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 flush=True,
             )
         selected = load_alignment_checkpoint(best_path)
-        if selected["config"] != config or selected["provenance"] != provenance:
+        if (_canonical_configuration(selected["config"]) != _canonical_configuration(config)
+                or selected["provenance"] != provenance):
             raise ValueError("Best checkpoint does not belong to this TMR run")
         model.load_state_dict(selected["model"], strict=True)
         test = evaluate_split(
@@ -352,6 +384,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 writer.add_scalar(f"test/{key}", value, global_step)
         summary = {
             "input_source": args.input_source, "output_root": str(output),
+            "train_fraction": args.train_fraction,
+            "split_counts": {split: len(dataset) for split, dataset in datasets.items()},
             "selection": "mean_bidirectional_val_r1", "best_epoch": best_epoch,
             "best_val": {key.removeprefix("val_"): value for key, value in history[best_epoch - 1].items() if key.startswith("val_")},
             "test": test, "epochs_completed": len(history), "global_step": global_step,
@@ -378,6 +412,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--train-fraction", type=float, default=1.0,
+        help="Fraction of cached captioned train clips to use (0 < fraction <= 1); subset uses --seed. Val/test stay complete.",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -389,7 +427,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--embed-dim", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=6)
+    parser.add_argument(
+        "--depth", type=int, default=6,
+        help="Shared alignment-head depth; defaults to 6. Individual head options override it.",
+    )
+    parser.add_argument(
+        "--text-depth", type=int,
+        help="Text alignment-head Transformer blocks; defaults to --depth. The frozen text backbone is unchanged.",
+    )
+    parser.add_argument(
+        "--motion-depth", type=int,
+        help="Motion alignment-head Transformer blocks; defaults to --depth.",
+    )
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ff-dim", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.1)
