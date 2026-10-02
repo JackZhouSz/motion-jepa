@@ -7,7 +7,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from mask.utils import apply_index_masks, repeat_mask_blocks
+from mask.utils import apply_index_masks, index_mask_validity, repeat_mask_blocks
 
 from .modules import TransformerBlock1D, initialize_transformer
 from .pos_embs import ContinuousSinCosPosEmbed1D
@@ -104,25 +104,24 @@ class MotionTransformer1D(nn.Module):
         if masks is not None:
             if not masks:
                 raise ValueError("At least one context mask is required")
+            packed_active = index_mask_validity(masks).to(device=x.device)
+            if not packed_active.any(dim=1).all():
+                raise ValueError("Every context mask row must contain a valid token")
+            x = apply_index_masks(x, masks)
             if active is not None:
                 for mask in masks:
                     mask = mask.to(device=x.device, dtype=torch.long)
-                    if (
-                        mask.shape[0] != len(motion)
-                        or (mask < 0).any()
-                        or (mask >= self.num_frames).any()
-                        or not torch.gather(active, 1, mask).all()
-                    ):
+                    selected_valid = torch.gather(active, 1, mask.clamp_min(0))
+                    if not (selected_valid | (mask == -1)).all():
                         raise ValueError("Context masks select an invalid or padded frame")
-            x = apply_index_masks(x, masks)
-            active = None
+            active = packed_active if not packed_active.all() else None
         elif active is not None:
-            x = x * active.unsqueeze(-1).to(dtype=x.dtype)
+            x = x.masked_fill(~active.unsqueeze(-1), 0)
         for block in self.blocks:
             x = block(x, active)
         x = self.norm(x)
         if active is not None:
-            x = x * active.unsqueeze(-1).to(dtype=x.dtype)
+            x = x.masked_fill(~active.unsqueeze(-1), 0)
         return x
 
 
@@ -187,8 +186,21 @@ class MotionTransformerPredictor1D(nn.Module):
         if not masks_enc or not masks_pred:
             raise ValueError("Predictor requires encoder and target masks")
         batch_size = len(fps)
-        if len(context) != batch_size * len(masks_enc):
+        if (
+            context.ndim != 3
+            or context.shape[-1] != self.embed_dim
+            or len(context) != batch_size * len(masks_enc)
+        ):
             raise ValueError("Context batch does not match encoder mask count")
+        context_active = index_mask_validity(masks_enc).to(device=context.device)
+        target_active = index_mask_validity(masks_pred).to(device=context.device)
+        if context_active.shape != context.shape[:2]:
+            raise ValueError("Context token shape does not match encoder masks")
+        if (
+            not context_active.any(dim=1).all()
+            or not target_active.any(dim=1).all()
+        ):
+            raise ValueError("Every encoder and target mask row must contain a valid token")
         x = self.input_proj(context)
         position = self.positions(fps).to(device=x.device, dtype=x.dtype)
         x = x + apply_index_masks(position, masks_enc)
@@ -199,10 +211,17 @@ class MotionTransformerPredictor1D(nn.Module):
         target = self.mask_token.to(dtype=x.dtype) + target_position
         x = x.repeat(len(masks_pred), 1, 1)
         x = torch.cat([x, target], dim=1)
+        target_active = repeat_mask_blocks(target_active, batch_size, len(masks_enc))
+        active = torch.cat([context_active.repeat(len(masks_pred), 1), target_active], dim=1)
+        if active.all():
+            active = None
+        else:
+            x = x.masked_fill(~active.unsqueeze(-1), 0)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, active)
         x = self.norm(x[:, context_tokens:])
-        return self.output_proj(x)
+        output = self.output_proj(x)
+        return output.masked_fill(~target_active.unsqueeze(-1), 0) if active is not None else output
 
 
 def _encoder(size: str, **kwargs) -> MotionTransformer1D:

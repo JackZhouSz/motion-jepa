@@ -29,9 +29,11 @@ from helper import (
 )
 from mask import (
     MaskCollator1D,
+    MaskCollator1DV2,
     MaskCollator2D,
     PatchBodyRegionSegmentMaskCollator2D,
     PatchMaskCollator1D,
+    PatchMaskCollator1DV2,
     PatchMaskCollator2D,
     PatchRandomBodySegmentMaskCollator2D,
     PatchRandomSpatialSegmentMaskCollator2D,
@@ -40,6 +42,7 @@ from model import MODEL_FACTORIES, PREDICTOR_FACTORIES, TokenLayout
 from mask.utils import (
     apply_index_masks,
     gather_grid_masks,
+    index_mask_validity,
     repeat_mask_blocks,
 )
 from utils.distributed import (
@@ -525,12 +528,20 @@ def _load_checkpoint(
 
 def _build_mask_collator(args: dict, layout: TokenLayout):
     mask = args["mask"]
-    context_selection = str(mask.get("context_selection", "prefix"))
-    if context_selection not in ("prefix", "random"):
-        raise ValueError("mask.context_selection must be 'prefix' or 'random'")
+    version = str(mask.get("version", "v1"))
+    if version not in ("v1", "v2"):
+        raise ValueError("mask.version must be 'v1' or 'v2'")
+    if version == "v2" and layout.kind != "1d":
+        raise ValueError("mask.version='v2' currently supports only 1D masks")
+    context_selection = str(mask.get("context_selection", "all" if version == "v2" else "prefix"))
+    choices = ("all", "prefix", "random") if version == "v2" else ("prefix", "random")
+    if context_selection not in choices:
+        raise ValueError(f"mask.context_selection must be one of {choices}")
     if layout.kind != "1d" and context_selection != "prefix":
         raise ValueError("mask.context_selection='random' requires a 1D multiblock mask")
     strategy = str(mask.get("strategy", "multiblock"))
+    if version == "v2" and strategy != "multiblock":
+        raise ValueError("mask.version='v2' requires mask.strategy='multiblock'")
     if strategy == "random_spatial_segment":
         if layout.kind != "2d" or not layout.patchified:
             raise ValueError(
@@ -632,6 +643,17 @@ def _build_mask_collator(args: dict, layout: TokenLayout):
         allow_overlap=bool(mask["allow_overlap"]),
     )
     if layout.kind == "1d":
+        if version == "v2":
+            common["min_context_tokens"] = int(mask.get("min_context_tokens", 1))
+            common["min_context_ratio"] = float(mask.get("min_context_ratio", 0.2))
+            common["context_selection"] = context_selection
+            if layout.patchified:
+                return PatchMaskCollator1DV2(
+                    raw_num_frames=layout.raw_num_frames,
+                    temporal_patch_size=layout.temporal_patch_size,
+                    **common,
+                )
+            return MaskCollator1DV2(num_frames=layout.token_num_frames, **common)
         common["context_selection"] = context_selection
         if layout.patchified:
             return PatchMaskCollator1D(
@@ -660,6 +682,31 @@ def _build_mask_collator(args: dict, layout: TokenLayout):
         pred_joint_mask_ratio=tuple(mask["pred_joint_mask_ratio"]),
         **common,
     )
+
+
+def _prediction_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    masks_pred: list[torch.Tensor],
+    *,
+    num_enc_masks: int,
+    kind: str,
+) -> torch.Tensor:
+    """Keep the legacy loss; exclude v2 padding and weight samples equally."""
+    if kind != "1d":
+        return F.smooth_l1_loss(prediction, target)
+    active = index_mask_validity(masks_pred)
+    if bool(active.all()):
+        return F.smooth_l1_loss(prediction, target)
+    active = repeat_mask_blocks(active, masks_pred[0].shape[0], num_enc_masks)
+    if prediction.shape != target.shape or active.shape != prediction.shape[:2]:
+        raise ValueError("Prediction, target, and target-mask shapes do not match")
+    counts = active.sum(dim=1)
+    if bool((counts == 0).any()):
+        raise ValueError("Each target mask must contain at least one valid token")
+    token_loss = F.smooth_l1_loss(prediction, target, reduction="none").mean(dim=-1)
+    token_loss = token_loss.masked_fill(~active, 0.0)
+    return (token_loss.sum(dim=1) / counts).mean()
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -1328,7 +1375,10 @@ def main(args: dict, resume_preempt: bool = False, device=None):
                     target = repeat_mask_blocks(target, len(motion), len(masks_enc))
                 context = encoder(motion, fps, masks_enc, valid_frames=valid_frames)
                 prediction = predictor(context, fps, masks_enc, masks_pred)
-                loss = F.smooth_l1_loss(prediction, target)
+                loss = _prediction_loss(
+                    prediction, target, masks_pred,
+                    num_enc_masks=len(masks_enc), kind=layout.kind,
+                )
 
             # full precision
             if scaler is None:

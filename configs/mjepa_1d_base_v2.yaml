@@ -1,0 +1,75 @@
+data:
+  batch_size: 512  # Per rank; global batch is batch_size * world_size.
+  root_path: ./dataset/bones-seed-processed-v2-nframes150-min60
+  meta_files:
+    - train.txt
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+  drop_last: true
+  num_frames: 150
+  fps: 30
+  motion_dim: 366
+  num_joints: 30
+  normalize: true
+  stats_path: stats
+
+logging:
+  folder: ./output/mot_base_1d-v2-bs.512-ep.300-nframes60-150
+  write_tag: motion-jepa-1d-v2
+  log_freq: 100
+  tensorboard: true
+  tensorboard_folder: tensorboard
+  checkpoint_freq: 100
+
+linear_probe:
+  enabled: false
+
+segmentation_probe:
+  enabled: true
+  frequency: 30
+  dataset_root: ./dataset/babel-segmentation-120-processed-nframes30-150
+  epochs: 50
+  feature_batch_size: 256
+  batch_size: 256
+  num_workers: 8
+  lr: 0.3
+  momentum: 0.9
+  weight_decay: 0.0
+  seed: 42
+  standardize: true
+
+attentive_probe:
+  enabled: false
+
+mask:
+  version: v2
+  context_selection: random  # all | prefix | random
+  min_context_tokens: 1
+  min_context_ratio: 0.2  # Minimum valid context fraction for each sample.
+  allow_overlap: false
+  num_enc_masks: 1
+  num_pred_masks: 4
+  enc_frame_mask_ratio: [0.85, 1.0]
+  pred_frame_mask_ratio: [0.15, 0.2]
+
+meta:
+  seed: 0
+  load_checkpoint: false
+  read_checkpoint: null
+  model_name: mot_base_1d
+  predictor_name: mot_predictor_base_1d
+  use_bfloat16: true
+  use_float16: false
+
+optimization:
+  ema: [0.996, 1.0]
+  epochs: 300
+  final_lr: 1.0e-6
+  final_weight_decay: 0.4
+  ipe_scale: 1.0
+  lr: 0.0005
+  start_lr: 0.0001
+  warmup: 40
+  weight_decay: 0.04
+  clip_grad: 1.0

@@ -89,6 +89,9 @@ def _mask_to_numpy(
             )
         return selected
     selected = mask[sample_index].detach().cpu().numpy().astype(np.int64)
+    if np.any(selected < -1) or np.any(selected >= layout.token_num_frames):
+        raise ValueError("1D mask contains an invalid token index")
+    selected = selected[selected >= 0]
     result = np.zeros(layout.token_num_frames, dtype=bool)
     result[selected] = True
     return result
