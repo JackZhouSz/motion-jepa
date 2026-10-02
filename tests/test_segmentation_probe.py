@@ -188,6 +188,18 @@ class SegmentationProbeTest(unittest.TestCase):
             saved = torch.load(output / "latest.pth.tar", map_location="cpu", weights_only=False)
             self.assertEqual(saved["next_epoch"], 2)
             self.assertIn("momentum_buffer", next(iter(saved["optimizer"]["state"].values())))
+            # A pre-RoPE absolute checkpoint and its feature caches remain resumable.
+            saved["provenance"].pop("position_encoding")
+            torch.save(saved, output / "latest.pth.tar")
+            provenance_path = output / "provenance.json"
+            legacy_provenance = json.loads(provenance_path.read_text())
+            legacy_provenance.pop("position_encoding")
+            provenance_path.write_text(json.dumps(legacy_provenance))
+            for split in ("train", "val"):
+                legacy_path = output / f"{split}-tokens.pt"
+                legacy_payload = torch.load(legacy_path, map_location="cpu", weights_only=False)
+                legacy_payload["provenance"].pop("position_encoding")
+                torch.save(legacy_payload, legacy_path)
             cache_path = output / "train-tokens.pt"
             cache_payload = torch.load(cache_path, map_location="cpu", weights_only=False)
             corrupted = copy.deepcopy(cache_payload)
@@ -225,6 +237,11 @@ class SegmentationProbeTest(unittest.TestCase):
             self.assertTrue(all(parameter.grad is None for parameter in encoder.parameters()))
             with patch("experiment.segmentation_probe.online.train_head_epoch", side_effect=AssertionError("result not reused")):
                 self.assertEqual(probe.evaluate(encoder, pretrain_epoch=30), result)
+            rope_encoder = MotionPatchTransformer1D(6, 8, temporal_patch_size=2,
+                embed_dim=12, depth=1, num_heads=3, position_encoding="rope").eval().requires_grad_(False)
+            rope_encoder.load_state_dict(encoder.state_dict(), strict=True)
+            with self.assertRaisesRegex(ValueError, "provenance mismatch"):
+                probe.evaluate(rope_encoder, pretrain_epoch=30)
             with torch.no_grad():
                 next(encoder.parameters()).add_(0.01)
             with self.assertRaisesRegex(ValueError, "provenance mismatch"):

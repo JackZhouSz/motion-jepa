@@ -26,6 +26,7 @@ from helper import (
     architecture_signature_from_config,
     init_mjepa_model_from_config,
     init_opt,
+    normalize_architecture_signature,
 )
 from mask import (
     MaskCollator1D,
@@ -476,7 +477,7 @@ def _load_checkpoint(
         saved_architecture = checkpoint.get("architecture")
         if saved_architecture is None:
             saved_architecture = architecture_signature_from_config(checkpoint["config"])
-        if saved_architecture != architecture:
+        if normalize_architecture_signature(saved_architecture) != normalize_architecture_signature(architecture):
             raise ValueError(
                 "Checkpoint architecture differs from the requested run: "
                 f"checkpoint={saved_architecture}, requested={architecture}"

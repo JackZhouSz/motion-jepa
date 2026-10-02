@@ -50,6 +50,8 @@ class IndexMaskPaddingTest(unittest.TestCase):
 
 
 class Padded1DModelTest(unittest.TestCase):
+    position_encoding = "absolute"
+
     def setUp(self):
         torch.manual_seed(31)
         self.motion = torch.randn(2, 18, 6)
@@ -59,10 +61,12 @@ class Padded1DModelTest(unittest.TestCase):
     def _setup(self, patchified):
         if patchified:
             encoder = MotionPatchTransformer1D(
-                6, 18, temporal_patch_size=3, embed_dim=12, depth=2, num_heads=3
+                6, 18, temporal_patch_size=3, embed_dim=12, depth=2, num_heads=3,
+                position_encoding=self.position_encoding,
             )
             predictor = MotionPatchTransformerPredictor1D(
-                18, 3, 12, 12, depth=2, num_heads=3
+                18, 3, 12, 12, depth=2, num_heads=3,
+                position_encoding=self.position_encoding,
             )
             contexts = [
                 torch.tensor([[0, 2, 4], [0, -1, -1]]),
@@ -73,8 +77,14 @@ class Padded1DModelTest(unittest.TestCase):
                 torch.tensor([[0, 5], [0, 2]]),
             ]
         else:
-            encoder = MotionTransformer1D(6, 18, embed_dim=12, depth=2, num_heads=3)
-            predictor = MotionTransformerPredictor1D(18, 12, 12, depth=2, num_heads=3)
+            encoder = MotionTransformer1D(
+                6, 18, embed_dim=12, depth=2, num_heads=3,
+                position_encoding=self.position_encoding,
+            )
+            predictor = MotionTransformerPredictor1D(
+                18, 12, 12, depth=2, num_heads=3,
+                position_encoding=self.position_encoding,
+            )
             contexts = [
                 torch.tensor([[0, 2, 4, 6], [0, 2, -1, -1]]),
                 torch.tensor([[1, 3, 5, 7], [1, 3, 5, -1]]),
@@ -178,6 +188,12 @@ class Padded1DModelTest(unittest.TestCase):
                 self.assertEqual(torch.count_nonzero(motion.grad[1, 10:]).item(), 0)
                 self.assertEqual(torch.count_nonzero(encoded.grad[~index_mask_validity(contexts)]).item(), 0)
                 self.assertTrue(torch.isfinite(motion.grad).all())
+
+
+class RoPEPadded1DModelTest(Padded1DModelTest):
+    """Run the same padding, multi-mask ordering and gradient contract with RoPE."""
+
+    position_encoding = "rope"
 
 
 if __name__ == '__main__':

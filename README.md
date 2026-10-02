@@ -191,6 +191,41 @@ Named factories are available for `tiny`, `small`, `base`, `large`, `huge`,
 and `giant`, for example `mot_base_1d` and `mot_base_2d`. There are no
 unsuffixed compatibility aliases.
 
+### Temporal RoPE for 1D models
+
+Frame-token and temporal-patch `_1d` encoders and predictors can use rotary
+position embeddings instead of additive absolute sinusoidal embeddings:
+
+```yaml
+position_encoding:
+  temporal: rope  # absolute (default) | rope
+  rope_theta: 100.0
+  rope_time_scale: 1.0
+```
+
+RoPE rotates queries and keys in every attention layer using the original
+token times. Frame positions are `frame_index / fps`; patch positions are
+`(patch_index * patch_size + (patch_size - 1) / 2) / fps`. Positions are gathered
+with the same masks as context and target tokens, so removing target tokens
+preserves the elapsed time between visible tokens. Predictor context and target
+positions use the same timeline even though their tokens are concatenated.
+The EMA target encoder uses the full timeline. Padding remains excluded from
+attention and loss.
+
+`rope_time_scale` multiplies these times before rotation; its default retains
+seconds. `rope_theta` controls the frequency spectrum. Both must be finite and
+positive. RoPE currently supports 1D models only and does not change the
+configured input length or masking policy. For a controlled V2 experiment:
+
+```bash
+python main.py --config configs/mjepa_patch_1d_base_v2_rope.yaml --devices cuda:0
+```
+
+Omitting `position_encoding` retains the existing absolute behavior, including
+old checkpoints. Exact resume requires the same positional mode, theta, and
+time scale; use a separate training run when changing them. Frozen downstream
+encoders reconstruct these settings from the saved pretraining configuration.
+
 ## Training
 
 Batch size is per rank. Learning rates are not automatically scaled.

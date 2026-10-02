@@ -10,7 +10,12 @@ import torch.nn as nn
 from mask.utils import apply_index_masks, index_mask_validity, repeat_mask_blocks
 
 from .modules import TransformerBlock1D, _make_safe_attention_mask, initialize_transformer
-from .pos_embs import ContinuousSinCosPosEmbed1D
+from .pos_embs import (
+    ContinuousSinCosPosEmbed1D,
+    RotaryPosEmbed1D,
+    normalize_position_encoding,
+    temporal_token_positions,
+)
 from .specs import MODEL_SPECS, PREDICTOR_SPECS
 from .token_layout import TokenLayout
 
@@ -57,6 +62,9 @@ class MotionPatchTransformer1D(nn.Module):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         norm_layer=partial(nn.LayerNorm, eps=1.0e-6),
+        position_encoding: str = "absolute",
+        rope_theta: float = 100.0,
+        rope_time_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.in_chans = int(in_chans)
@@ -82,6 +90,14 @@ class MotionPatchTransformer1D(nn.Module):
         )
         self.positions = _TemporalPatchPositions(
             self.num_frames, self.temporal_patch_size, self.embed_dim
+        )
+        settings = normalize_position_encoding(position_encoding, rope_theta, rope_time_scale)
+        self.position_encoding = settings["temporal"]
+        self.rope_theta = settings.get("rope_theta", 100.0)
+        self.rope_time_scale = settings.get("rope_time_scale", 1.0)
+        self.rotary = (
+            RotaryPosEmbed1D(self.embed_dim // self.num_heads, self.rope_theta, self.rope_time_scale)
+            if self.position_encoding == "rope" else None
         )
         drop_paths = torch.linspace(0.0, drop_path_rate, depth).tolist()
         self.blocks = nn.ModuleList(
@@ -117,7 +133,13 @@ class MotionPatchTransformer1D(nn.Module):
                 f"Expected motion [B,{self.num_frames},{self.in_chans}], got {tuple(motion.shape)}"
             )
         x = self.patch_embed(motion.transpose(1, 2)).transpose(1, 2)
-        x = x + self.positions(fps).to(device=x.device, dtype=x.dtype)
+        times = None
+        if self.rotary is None:
+            x = x + self.positions(fps).to(device=x.device, dtype=x.dtype)
+        else:
+            times = temporal_token_positions(
+                self.num_frames, fps, self.temporal_patch_size, device=x.device
+            )
         active = None
         if valid_frames is not None:
             active = self.token_layout.valid_token_mask(
@@ -130,6 +152,8 @@ class MotionPatchTransformer1D(nn.Module):
             if not packed_active.any(dim=1).all():
                 raise ValueError("Every context mask row must contain a valid token")
             x = apply_index_masks(x, masks)
+            if times is not None:
+                times = apply_index_masks(times.unsqueeze(-1), masks).squeeze(-1)
             if active is not None:
                 for mask in masks:
                     index = mask.to(device=x.device, dtype=torch.long)
@@ -140,8 +164,9 @@ class MotionPatchTransformer1D(nn.Module):
         elif active is not None:
             x = x.masked_fill(~active.unsqueeze(-1), 0)
         attention_active = _make_safe_attention_mask(active) if active is not None else None
+        rotary = self.rotary(times) if self.rotary is not None else None
         for block in self.blocks:
-            x = block(x, attention_active)
+            x = block(x, attention_active, rotary)
         x = self.norm(x)
         if active is not None:
             x = x.masked_fill(~active.unsqueeze(-1), 0)
@@ -165,6 +190,9 @@ class MotionPatchTransformerPredictor1D(nn.Module):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
         norm_layer=partial(nn.LayerNorm, eps=1.0e-6),
+        position_encoding: str = "absolute",
+        rope_theta: float = 100.0,
+        rope_time_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.num_frames = int(num_frames)
@@ -184,6 +212,14 @@ class MotionPatchTransformerPredictor1D(nn.Module):
         self.input_proj = nn.Linear(self.embed_dim, self.predictor_embed_dim)
         self.positions = _TemporalPatchPositions(
             self.num_frames, self.temporal_patch_size, self.predictor_embed_dim
+        )
+        settings = normalize_position_encoding(position_encoding, rope_theta, rope_time_scale)
+        self.position_encoding = settings["temporal"]
+        self.rope_theta = settings.get("rope_theta", 100.0)
+        self.rope_time_scale = settings.get("rope_time_scale", 1.0)
+        self.rotary = (
+            RotaryPosEmbed1D(self.predictor_embed_dim // num_heads, self.rope_theta, self.rope_time_scale)
+            if self.position_encoding == "rope" else None
         )
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.predictor_embed_dim))
         drop_paths = torch.linspace(0.0, drop_path_rate, depth).tolist()
@@ -233,14 +269,27 @@ class MotionPatchTransformerPredictor1D(nn.Module):
         ):
             raise ValueError("Every encoder and target mask row must contain a valid token")
         x = self.input_proj(context)
-        position = self.positions(fps).to(device=x.device, dtype=x.dtype)
-        x = x + apply_index_masks(position, masks_enc)
         context_tokens = context.shape[1]
-        target_position = apply_index_masks(position, masks_pred)
-        target_position = repeat_mask_blocks(
-            target_position, batch_size, len(masks_enc)
-        )
-        target = self.mask_token.to(dtype=x.dtype) + target_position
+        rotary = None
+        if self.rotary is None:
+            position = self.positions(fps).to(device=x.device, dtype=x.dtype)
+            x = x + apply_index_masks(position, masks_enc)
+            target_position = apply_index_masks(position, masks_pred)
+            target_position = repeat_mask_blocks(target_position, batch_size, len(masks_enc))
+            target = self.mask_token.to(dtype=x.dtype) + target_position
+        else:
+            times = temporal_token_positions(
+                self.num_frames, fps, self.temporal_patch_size, device=x.device
+            ).unsqueeze(-1)
+            context_time = apply_index_masks(times, masks_enc).repeat(len(masks_pred), 1, 1)
+            target_time = repeat_mask_blocks(
+                apply_index_masks(times, masks_pred), batch_size, len(masks_enc)
+            )
+            # Storage is [context, target], but both use original motion times.
+            rotary = self.rotary(torch.cat([context_time, target_time], dim=1).squeeze(-1))
+            target = self.mask_token.to(dtype=x.dtype).expand(
+                target_time.shape[0], target_time.shape[1], -1
+            )
         x = x.repeat(len(masks_pred), 1, 1)
         x = torch.cat([x, target], dim=1)
         target_active = repeat_mask_blocks(target_active, batch_size, len(masks_enc))
@@ -250,7 +299,7 @@ class MotionPatchTransformerPredictor1D(nn.Module):
         else:
             x = x.masked_fill(~active.unsqueeze(-1), 0)
         for block in self.blocks:
-            x = block(x, active)
+            x = block(x, active, rotary)
         x = self.norm(x[:, context_tokens:])
         output = self.output_proj(x)
         return output.masked_fill(~target_active.unsqueeze(-1), 0) if active is not None else output

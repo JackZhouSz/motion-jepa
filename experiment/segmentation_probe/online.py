@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset.babel_segmentation import BabelSegmentationDataset
+from helper import position_encoding_from_model
 from experiment.linear_probe.features import (
     PROJECT_ROOT, _atomic_json_save, _atomic_torch_save, _seed_all,
     _sha256_file, resolve_pretraining_stats,
@@ -46,6 +47,14 @@ def _encoder_digest(encoder) -> str:
         digest.update(json.dumps([name, str(value.dtype), list(value.shape)]).encode())
         digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def _matches_provenance(actual, expected: dict) -> bool:
+    if not isinstance(actual, dict):
+        return False
+    # Existing caches predate configurable positions and always used absolute PE.
+    normalized = {"position_encoding": {"temporal": "absolute"}, **actual}
+    return normalized == expected
 
 
 def _cache_digest(cache: dict) -> str:
@@ -343,18 +352,19 @@ class OnlineSegmentationProbe:
                       "target_encoder_sha256": _encoder_digest(encoder),
                       "pretrain_epoch": pretrain_epoch,
                       "token_layout": encoder.token_layout.signature(),
+                      "position_encoding": position_encoding_from_model(encoder),
                       "feature_dim": int(encoder.embed_dim)}
         provenance_path = output / "provenance.json"
         if provenance_path.exists():
             saved = json.loads(provenance_path.read_text())
-            if saved != provenance:
+            if not _matches_provenance(saved, provenance):
                 raise ValueError(f"Segmentation cache/result provenance mismatch: {output}")
         else:
             _atomic_json_save(provenance, provenance_path)
             _atomic_json_save(self.protocol, output / "config.json")
         if (output / "summary.json").is_file():
             summary = json.loads((output / "summary.json").read_text())
-            if summary.get("provenance") != provenance:
+            if not _matches_provenance(summary.get("provenance"), provenance):
                 raise ValueError("Completed segmentation summary has mismatched provenance")
             return summary
 
@@ -364,7 +374,7 @@ class OnlineSegmentationProbe:
             path = output / f"{split}-tokens.pt"
             if path.is_file():
                 payload = torch.load(path, map_location="cpu", weights_only=False)
-                if payload.get("provenance") != provenance or payload.get("split") != split:
+                if not _matches_provenance(payload.get("provenance"), provenance) or payload.get("split") != split:
                     raise ValueError(f"Wrong segmentation token cache: {path}")
                 caches[split] = payload["cache"]
                 self._validate_cache(caches[split], dataset, encoder, payload.get("cache_sha256"))
@@ -391,7 +401,7 @@ class OnlineSegmentationProbe:
         best_metrics, best_score, elapsed_before = None, float("-inf"), 0.0
         if latest_path.exists():
             checkpoint = torch.load(latest_path, map_location="cpu", weights_only=False)
-            if checkpoint.get("provenance") != provenance:
+            if not _matches_provenance(checkpoint.get("provenance"), provenance):
                 raise ValueError("Segmentation head resume provenance mismatch")
             head.load_state_dict(checkpoint["head"])
             optimizer.load_state_dict(checkpoint["optimizer"])

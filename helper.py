@@ -21,10 +21,50 @@ from model.motion_patch_transformer_2d import (
     TRAJECTORY_FIELDS,
     TRAJECTORY_TOKEN_INDEX,
 )
+from model.pos_embs import normalize_position_encoding
 from utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
 
 
 logger = logging.getLogger(__name__)
+
+
+def position_encoding_from_config(config: dict) -> dict:
+    """Resolve position settings, retaining absolute positions for legacy configs."""
+    settings = config.get("position_encoding", {})
+    if not isinstance(settings, dict):
+        raise ValueError("position_encoding must be a mapping")
+    unknown = set(settings) - {"temporal", "rope_theta", "rope_time_scale"}
+    if unknown:
+        raise ValueError(f"Unknown position_encoding settings: {sorted(unknown)}")
+    return normalize_position_encoding(
+        settings.get("temporal", "absolute"),
+        settings.get("rope_theta", 100.0),
+        settings.get("rope_time_scale", 1.0),
+    )
+
+
+def position_encoding_from_model(model) -> dict:
+    return normalize_position_encoding(
+        getattr(model, "position_encoding", "absolute"),
+        getattr(model, "rope_theta", 100.0),
+        getattr(model, "rope_time_scale", 1.0),
+    )
+
+
+def normalize_architecture_signature(signature: dict) -> dict:
+    """Interpret signatures saved before configurable positions as absolute."""
+    return {**signature, "position_encoding": position_encoding_from_config(signature)}
+
+
+def _position_kwargs(settings: dict, kind: str) -> dict:
+    if kind == "2d":
+        if settings["temporal"] == "rope":
+            raise ValueError("RoPE currently supports only 1D encoders and predictors")
+        return {}
+    return {
+        "position_encoding": settings["temporal"],
+        **{key: value for key, value in settings.items() if key != "temporal"},
+    }
 
 
 def init_mjepa_model(
@@ -37,7 +77,11 @@ def init_mjepa_model(
     temporal_patch_size: int = 1,
     spatial_grouping: str = "fine11",
     spatial_pooling: str = "graph_mean",
+    position_encoding: str = "absolute",
+    rope_theta: float = 100.0,
+    rope_time_scale: float = 1.0,
 ):
+    positions = normalize_position_encoding(position_encoding, rope_theta, rope_time_scale)
     try:
         factory = MODEL_FACTORIES[model_name]
     except KeyError as error:
@@ -45,6 +89,7 @@ def init_mjepa_model(
         raise ValueError(f"Unknown model_name {model_name!r}; choose one of: {choices}") from error
     is_patch_model = model_name in PATCH_MODEL_NAMES
     encoder_kwargs = {"in_chans": motion_dim, "num_frames": num_frames}
+    encoder_kwargs.update(_position_kwargs(positions, MODEL_KINDS[model_name]))
     if is_patch_model:
         encoder_kwargs["temporal_patch_size"] = int(temporal_patch_size)
     if MODEL_KINDS[model_name] == "2d":
@@ -63,6 +108,7 @@ def init_mjepa_model(
         raise ValueError(f"Unknown predictor_name {predictor_name!r}; choose one of: {choices}") from error
     is_patch_predictor = predictor_name in PATCH_PREDICTOR_NAMES
     predictor_kwargs = {"num_frames": num_frames, "embed_dim": encoder.embed_dim}
+    predictor_kwargs.update(_position_kwargs(positions, PREDICTOR_KINDS[predictor_name]))
     if is_patch_predictor:
         predictor_kwargs["temporal_patch_size"] = int(temporal_patch_size)
     if PREDICTOR_KINDS[predictor_name] == "2d":
@@ -100,6 +146,7 @@ def init_mjepa_model_from_config(config: dict, device: torch.device):
     data = config["data"]
     meta = config["meta"]
     grouping, pooling = spatial_patch_from_config(config)
+    positions = position_encoding_from_config(config)
     encoder, predictor = init_mjepa_model(
         device=device,
         num_frames=int(data["num_frames"]),
@@ -110,6 +157,9 @@ def init_mjepa_model_from_config(config: dict, device: torch.device):
         temporal_patch_size=patch_size_from_config(config),
         spatial_grouping=grouping,
         spatial_pooling=pooling,
+        position_encoding=positions["temporal"],
+        rope_theta=positions.get("rope_theta", 100.0),
+        rope_time_scale=positions.get("rope_time_scale", 1.0),
     )
     if hasattr(predictor, "_packed_spatial_disjoint"):
         mask = config.get("mask")
@@ -140,6 +190,7 @@ def init_mjepa_encoder_from_config(config: dict, device: torch.device):
         "in_chans": int(data["motion_dim"]),
         "num_frames": int(data["num_frames"]),
     }
+    kwargs.update(_position_kwargs(position_encoding_from_config(config), MODEL_KINDS[model_name]))
     if model_name in PATCH_MODEL_NAMES:
         kwargs["temporal_patch_size"] = patch_size_from_config(config)
     if MODEL_KINDS[model_name] == "2d":
@@ -158,12 +209,16 @@ def architecture_signature(
     predictor_name: str,
     motion_dim: int,
 ) -> dict:
+    positions = position_encoding_from_model(encoder)
+    if positions != position_encoding_from_model(predictor):
+        raise ValueError("Encoder and predictor positional configurations differ")
     signature = {
         "model_name": str(model_name),
         "predictor_name": str(predictor_name),
         "motion_dim": int(motion_dim),
         "encoder_layout": encoder.token_layout.signature(),
         "predictor_layout": predictor.token_layout.signature(),
+        "position_encoding": positions,
     }
     encoder_spatial = getattr(encoder, "spatial_patch_signature", None)
     predictor_spatial = getattr(predictor, "spatial_patch_signature", None)
@@ -193,6 +248,9 @@ def architecture_signature_from_config(config: dict) -> dict:
     raw_frames = int(data["num_frames"])
     kind = MODEL_KINDS[model_name]
     predictor_kind = PREDICTOR_KINDS[predictor_name]
+    positions = position_encoding_from_config(config)
+    _position_kwargs(positions, kind)
+    _position_kwargs(positions, predictor_kind)
     grouping, pooling = spatial_patch_from_config(config)
     has_spatial_patch = (
         (kind == "2d" and patchified)
@@ -239,6 +297,7 @@ def architecture_signature_from_config(config: dict) -> dict:
         "model_name": model_name,
         "predictor_name": predictor_name,
         "motion_dim": int(data["motion_dim"]),
+        "position_encoding": positions,
         "encoder_layout": layout_signature(kind, patchified, patch_size),
         "predictor_layout": layout_signature(
             predictor_kind, predictor_patchified, predictor_patch_size
@@ -302,6 +361,9 @@ __all__ = [
     "init_mjepa_model",
     "init_mjepa_model_from_config",
     "init_opt",
+    "normalize_architecture_signature",
     "patch_size_from_config",
+    "position_encoding_from_config",
+    "position_encoding_from_model",
     "spatial_patch_from_config",
 ]
